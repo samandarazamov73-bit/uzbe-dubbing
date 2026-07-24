@@ -26,6 +26,7 @@ Uzbek Video Dubbing — всё приложение в одном файле.
   MAX_UPLOAD_MB=500
   MAX_VIDEO_MINUTES=20
   JOB_TTL_HOURS=24
+  TTS_CONCURRENCY=4      # сколько реплик озвучивать параллельно
   PORT=8000
 
 API-ключ намеренно не хранится в этом файле и не отправляется в браузер.
@@ -47,7 +48,7 @@ import urllib.parse
 import uuid
 import wave
 from array import array
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -476,6 +477,34 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
+TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
+
+
+def _generate_segment(
+    client: GeminiClient,
+    segment: DubSegment,
+    voice_map: dict[str, str],
+    global_style: str,
+    segments_dir: Path,
+) -> tuple[Path, str, str]:
+    raw = segments_dir / f"{segment.index:04d}-raw.wav"
+    fitted = segments_dir / f"{segment.index:04d}.wav"
+    voice = voice_map.get(segment.speaker, voice_map["female"])
+    spoken_text = segment.translated_text
+    client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
+    shorten_attempts = 0
+    while (
+        media_duration(raw) > segment.duration * 1.2
+        and len(spoken_text) > 12
+        and shorten_attempts < 2
+    ):
+        spoken_text = client.shorten(spoken_text, segment.duration)
+        client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
+        shorten_attempts += 1
+    normalize_and_fit(raw, fitted, segment.duration)
+    return fitted, spoken_text, voice
+
+
 def render_timeline(
     duration: float,
     segments: list[DubSegment],
@@ -491,23 +520,29 @@ def render_timeline(
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
 
-    for number, segment in enumerate(segments, start=1):
-        raw = segments_dir / f"{segment.index:04d}-raw.wav"
-        fitted = segments_dir / f"{segment.index:04d}.wav"
-        voice = voice_map.get(segment.speaker, voice_map["female"])
-        spoken_text = segment.translated_text
-        client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
-        shorten_attempts = 0
-        while (
-            media_duration(raw) > segment.duration * 1.2
-            and len(spoken_text) > 12
-            and shorten_attempts < 2
-        ):
-            spoken_text = client.shorten(spoken_text, segment.duration)
-            client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
-            shorten_attempts += 1
-        normalize_and_fit(raw, fitted, segment.duration)
+    # Генерируем реплики параллельно — это кратно быстрее строго последовательной озвучки.
+    generated: dict[int, tuple[Path, str, str]] = {}
+    total = len(segments)
+    done = 0
+    workers = max(1, min(TTS_CONCURRENCY, total))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
+        futures = {
+            pool.submit(
+                _generate_segment, client, segment, voice_map, global_style, segments_dir
+            ): segment
+            for segment in segments
+        }
+        for future in as_completed(futures):
+            segment = futures[future]
+            generated[segment.index] = future.result()
+            done += 1
+            progress(
+                45 + round(done / total * 40),
+                f"Озвучено {done} из {total} реплик",
+            )
 
+    for segment in segments:
+        fitted, spoken_text, voice = generated[segment.index]
         clip = read_mono_pcm(fitted)
         start_sample = max(0, int(segment.start * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
@@ -525,10 +560,6 @@ def render_timeline(
                 "voice": voice,
                 "style": segment.style,
             }
-        )
-        progress(
-            45 + round(number / len(segments) * 40),
-            f"Озвучивается реплика {number} из {len(segments)}",
         )
 
     output = work_dir / "dubbed.wav"
