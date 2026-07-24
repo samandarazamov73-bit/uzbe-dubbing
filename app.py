@@ -191,10 +191,15 @@ class GeminiClient:
                 for item in batch
             ]
             prompt = (
-                "Переведи реплики для видеодубляжа на естественный разговорный узбекский "
-                "язык ЛАТИНИЦЕЙ. Сохрани смысл, имена и числа. Сделай каждую реплику достаточно "
-                "короткой для duration_seconds. Не добавляй объяснений. Верни только JSON-массив "
-                'вида [{"id":0,"translated_text":"..."}].\nВход:\n'
+                "Ты профессиональный переводчик-дубляжист. Переведи реплики ниже на живой, "
+                "грамматически правильный разговорный узбекский язык ЛАТИНИЦЕЙ. Это "
+                "последовательные фразы одного видео — переводи их как связный текст, сохраняя "
+                "точный смысл, имена, числа и порядок реплик. Пиши естественно, как носитель "
+                "языка, а НЕ буквальным подстрочником. Поле duration_seconds — это лишь мягкая "
+                "подсказка по длине произношения: сокращай формулировку только если фраза "
+                "значительно длиннее, и никогда в ущерб грамматике и ясности. Не добавляй "
+                'пояснений и комментариев. Верни только JSON-массив вида '
+                '[{"id":0,"translated_text":"..."}].\nРеплики:\n'
                 + json.dumps(source, ensure_ascii=False)
             )
             data = self._post(
@@ -202,7 +207,7 @@ class GeminiClient:
                 {
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                     "generation_config": {
-                        "temperature": 0.2,
+                        "temperature": 0.35,
                         "response_mime_type": "application/json",
                     },
                 },
@@ -234,8 +239,10 @@ class GeminiClient:
 
     def shorten(self, text: str, duration: float) -> str:
         prompt = (
-            f"Сократи узбекскую реплику для произнесения максимум за {duration:.1f} сек. "
-            "Сохрани смысл и узбекскую латиницу. Верни только реплику без кавычек:\n" + text
+            f"Слегка сократи эту узбекскую реплику, чтобы её можно было произнести НЕ спеша "
+            f"примерно за {duration:.1f} сек. Сохрани грамматику, смысл и узбекскую латиницу — "
+            "не переводи заново, только сократи формулировку. Верни только сокращённую реплику "
+            "без кавычек и пояснений:\n" + text
         )
         data = self._post(
             self.text_model,
@@ -247,9 +254,11 @@ class GeminiClient:
         return self._response_text(data).strip().strip('"')
 
     def tts(self, text: str, voice: str, output_path: Path, duration: float) -> None:
-        pace = "quickly but clearly" if duration < 3.0 else "naturally and expressively"
         prompt = (
-            f"Speak {pace} in natural Uzbek. Read only the text after MATN, without comments.\n"
+            "Speak naturally and clearly in fluent, conversational Uzbek at a normal, "
+            "unhurried pace — never rush the delivery, even for short lines. Try to stay "
+            f"close to {duration:.1f} seconds only through natural pacing, not by speaking "
+            "fast. Read only the text after MATN, without adding comments.\n"
             f"MATN:\n{text}"
         )
         data = self._post(
@@ -406,11 +415,15 @@ def atempo_filter(ratio: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
+MAX_SPEED_UP_RATIO = 1.15  # never speed up dubbed speech by more than ~15%
+
+
 def normalize_and_fit(source: Path, output: Path, target_seconds: float) -> None:
     actual = media_duration(source)
     filters: list[str] = []
     if actual > target_seconds * 1.04:
-        filters.extend(["-filter:a", atempo_filter(actual / max(target_seconds, 0.25))])
+        ratio = min(actual / max(target_seconds, 0.25), MAX_SPEED_UP_RATIO)
+        filters.extend(["-filter:a", atempo_filter(ratio)])
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), *filters, "-t", f"{target_seconds:.3f}",
@@ -450,9 +463,15 @@ def render_timeline(
         fitted = segments_dir / f"{segment.index:04d}.wav"
         spoken_text = segment.translated_text
         client.tts(spoken_text, voice, raw, segment.duration)
-        if media_duration(raw) > segment.duration * 1.65 and len(spoken_text) > 18:
+        shorten_attempts = 0
+        while (
+            media_duration(raw) > segment.duration * 1.2
+            and len(spoken_text) > 12
+            and shorten_attempts < 2
+        ):
             spoken_text = client.shorten(spoken_text, segment.duration)
             client.tts(spoken_text, voice, raw, segment.duration)
+            shorten_attempts += 1
         normalize_and_fit(raw, fitted, segment.duration)
 
         clip = read_mono_pcm(fitted)
