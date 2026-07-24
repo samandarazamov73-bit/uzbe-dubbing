@@ -19,7 +19,7 @@ Uzbek Video Dubbing — всё приложение в одном файле (п
 Настройки окружения (необязательно):
   GEMINI_TEXT_MODEL=gemini-2.5-flash
   GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
-  WHISPER_MODEL=small
+  WHISPER_MODEL=medium   # точнее small; для максимума качества можно large-v3 (медленнее)
   WHISPER_DEVICE=cpu
   WHISPER_COMPUTE_TYPE=int8
   MAX_UPLOAD_MB=500
@@ -193,72 +193,92 @@ class GeminiClient:
         except json.JSONDecodeError as exc:
             raise RuntimeError("Gemini вернул некорректный JSON перевода") from exc
 
+    def _translate_batch(
+        self,
+        context_lines: str,
+        target: list[dict[str, Any]],
+        results: dict[int, dict[str, Any]],
+    ) -> None:
+        target_ids = [item["index"] for item in target]
+        prompt = (
+            "Ты профессиональный режиссёр дубляжа. Ниже CONTEXT — весь скрипт видео "
+            "по порядку (для связности перевода, согласованности имён, терминов, тона и "
+            "местоимений). Переведи ТОЛЬКО реплики, чьи id указаны в TARGET.\n"
+            "Для каждой целевой реплики верни три поля:\n"
+            "1) translated_text — живой, грамматически правильный перевод на разговорный "
+            "УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ; естественно, как носитель, а не подстрочник; сохраняй "
+            "смысл, имена и числа. duration_seconds — мягкая подсказка по длине, сокращай "
+            "только при сильном превышении и никогда в ущерб смыслу.\n"
+            '2) speaker — пол говорящего: "male" или "female".\n'
+            "3) style — КОРОТКАЯ эмоция и подача на английском (2-4 слова), напр. "
+            '"angry, shouting", "soft and warm", "excited", "sad", "sarcastic", '
+            '"neutral calm".\n'
+            "Верни только JSON-массив вида "
+            '[{"id":0,"translated_text":"...","speaker":"male","style":"angry, shouting"}] '
+            "строго для id из TARGET.\n\nCONTEXT:\n"
+            + context_lines
+            + "\n\nTARGET ids: "
+            + json.dumps(target_ids)
+        )
+        data = self._post(
+            self.text_model,
+            {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generation_config": {
+                    "temperature": 0.35,
+                    "response_mime_type": "application/json",
+                },
+            },
+        )
+        result = self._json(self._response_text(data))
+        if isinstance(result, dict):
+            result = result.get("segments", result.get("translations", []))
+        if not isinstance(result, list):
+            raise RuntimeError("Gemini вернул перевод в неожиданном формате")
+        for item in result:
+            if isinstance(item, dict) and item.get("translated_text") and "id" in item:
+                results[int(item["id"])] = item
+
     def translate(self, segments: list[dict[str, Any]]) -> list[DubSegment]:
-        translated: list[DubSegment] = []
-        for offset in range(0, len(segments), 20):
-            batch = segments[offset : offset + 20]
-            source = [
+        # Весь скрипт передаётся как контекст в каждый запрос — перевод получается
+        # связным и согласованным, а не «вслепую» по кускам.
+        context_lines = json.dumps(
+            [
                 {
                     "id": item["index"],
                     "duration_seconds": round(item["end"] - item["start"], 2),
                     "text": item["text"],
                 }
-                for item in batch
-            ]
-            prompt = (
-                "Ты профессиональный режиссёр дубляжа. Для каждой реплики видео сделай три "
-                "вещи:\n"
-                "1) translated_text — живой, грамматически правильный перевод на разговорный "
-                "УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ. Переводи как связный текст, сохраняя смысл, имена и "
-                "числа, естественно, как носитель, а не подстрочником. duration_seconds — "
-                "мягкая подсказка по длине; сокращай только при сильном превышении и никогда в "
-                "ущерб смыслу.\n"
-                "2) speaker — пол говорящего по контексту: \"male\" или \"female\".\n"
-                "3) style — КОРОТКАЯ подсказка эмоции и подачи на английском (2-4 слова), "
-                "например \"angry, shouting\", \"soft and warm\", \"excited\", \"sad\", "
-                "\"sarcastic\", \"neutral calm\". Определи её по смыслу и тону реплики.\n"
-                "Верни только JSON-массив вида "
-                '[{"id":0,"translated_text":"...","speaker":"male","style":"angry, shouting"}].'
-                "\nРеплики:\n" + json.dumps(source, ensure_ascii=False)
-            )
-            data = self._post(
-                self.text_model,
-                {
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generation_config": {
-                        "temperature": 0.35,
-                        "response_mime_type": "application/json",
-                    },
-                },
-            )
-            result = self._json(self._response_text(data))
-            if isinstance(result, dict):
-                result = result.get("segments", result.get("translations", []))
-            if not isinstance(result, list):
-                raise RuntimeError("Gemini вернул перевод в неожиданном формате")
-            by_id: dict[int, dict[str, Any]] = {}
-            for item in result:
-                if isinstance(item, dict) and item.get("translated_text") and "id" in item:
-                    by_id[int(item["id"])] = item
-            for item in batch:
-                payload = by_id.get(item["index"])
-                if not payload:
-                    raise RuntimeError(f"Gemini пропустил реплику {item['index'] + 1}")
-                speaker = str(payload.get("speaker", "female")).strip().lower()
-                if speaker not in {"male", "female"}:
-                    speaker = "female"
-                style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
-                translated.append(
-                    DubSegment(
-                        index=item["index"],
-                        start=item["start"],
-                        end=item["end"],
-                        source_text=item["text"],
-                        translated_text=str(payload["translated_text"]).strip(),
-                        speaker=speaker,
-                        style=style,
-                    )
+                for item in segments
+            ],
+            ensure_ascii=False,
+        )
+
+        results: dict[int, dict[str, Any]] = {}
+        step = 40
+        for offset in range(0, len(segments), step):
+            self._translate_batch(context_lines, segments[offset : offset + step], results)
+
+        translated: list[DubSegment] = []
+        for item in segments:
+            payload = results.get(item["index"])
+            if not payload:
+                raise RuntimeError(f"Gemini пропустил реплику {item['index'] + 1}")
+            speaker = str(payload.get("speaker", "female")).strip().lower()
+            if speaker not in {"male", "female"}:
+                speaker = "female"
+            style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
+            translated.append(
+                DubSegment(
+                    index=item["index"],
+                    start=item["start"],
+                    end=item["end"],
+                    source_text=item["text"],
+                    translated_text=str(payload["translated_text"]).strip(),
+                    speaker=speaker,
+                    style=style,
                 )
+            )
         return translated
 
     def shorten(self, text: str, duration: float) -> str:
@@ -400,7 +420,7 @@ def extract_audio(video: Path, output: Path) -> None:
 
 
 def whisper_model():
-    name = os.getenv("WHISPER_MODEL", "small")
+    name = os.getenv("WHISPER_MODEL", "medium")
     with _whisper_lock:
         if name not in _whisper_models:
             try:
@@ -462,13 +482,18 @@ def normalize_and_fit(source: Path, output: Path, budget_seconds: float) -> None
     следующую реплику. Так слова не режутся и речь не тараторит.
     """
     actual = media_duration(source)
-    filters: list[str] = []
+    chain: list[str] = []
     if actual > budget_seconds * 1.02:
         ratio = min(actual / max(budget_seconds, 0.25), MAX_SPEED_UP_RATIO)
-        filters.extend(["-filter:a", atempo_filter(ratio)])
+        chain.append(atempo_filter(ratio))
+    # Микрофейды убирают щелчки в начале/конце реплики.
+    fade_out_start = max(0.0, budget_seconds - 0.04)
+    chain.append("afade=t=in:st=0:d=0.015")
+    chain.append(f"afade=t=out:st={fade_out_start:.3f}:d=0.04")
     run_command(
         [
-            "ffmpeg", "-y", "-i", str(source), *filters, "-t", f"{budget_seconds:.3f}",
+            "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
+            "-t", f"{budget_seconds:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -591,17 +616,23 @@ def render_timeline(
 def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
     should_mix = mode == "mix" and has_audio(video)
 
+    # loudnorm выравнивает громкость узбекской озвучки до вещательного уровня.
+    loudnorm = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
     def command(video_codec: list[str]) -> list[str]:
         base = ["ffmpeg", "-y", "-i", str(video), "-i", str(dubbed)]
         if should_mix:
             audio = [
                 "-filter_complex",
-                "[0:a:0]volume=0.18[original];[original][1:a:0]"
-                "amix=inputs=2:duration=longest:normalize=0[aout]",
+                f"[1:a:0]{loudnorm}[dub];[0:a:0]volume=0.16[orig];"
+                "[orig][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
             ]
         else:
-            audio = ["-map", "0:v:0", "-map", "1:a:0"]
+            audio = [
+                "-filter_complex", f"[1:a:0]{loudnorm}[aout]",
+                "-map", "0:v:0", "-map", "[aout]",
+            ]
         return base + audio + video_codec + [
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
             "-shortest", str(output),
