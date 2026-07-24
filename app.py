@@ -320,32 +320,53 @@ class GeminiClient:
             prompt += f"DIRECTION: {directions}\n"
         prompt += f"MATN:\n{text}"
 
-        data = self._post(
-            self.tts_model,
-            {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generation_config": {
-                    "response_modalities": ["AUDIO"],
-                    "speech_config": {
-                        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
-                    },
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generation_config": {
+                "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
                 },
             },
-        )
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise RuntimeError("Gemini TTS не вернул результат")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        inline = next(
-            (
-                part.get("inlineData") or part.get("inline_data")
-                for part in parts
-                if part.get("inlineData") or part.get("inline_data")
-            ),
-            None,
-        )
+        }
+
+        inline = None
+        detail = ""
+        for attempt in range(3):
+            data = self._post(self.tts_model, payload)
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                inline = next(
+                    (
+                        part.get("inlineData") or part.get("inline_data")
+                        for part in parts
+                        if part.get("inlineData") or part.get("inline_data")
+                    ),
+                    None,
+                )
+                if inline and inline.get("data"):
+                    break
+                # Диагностика: причина завершения и текст, если модель ответила словами.
+                reason = candidates[0].get("finishReason") or candidates[0].get(
+                    "finish_reason", "UNKNOWN"
+                )
+                returned_text = "".join(p.get("text", "") for p in parts).strip()
+                detail = f"finishReason={reason}"
+                if returned_text:
+                    detail += f", ответ моделью текстом: {returned_text[:200]}"
+            else:
+                detail = "пустой ответ (нет candidates)"
+            inline = None
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+
         if not inline or not inline.get("data"):
-            raise RuntimeError("Gemini TTS не вернул аудио")
+            raise RuntimeError(
+                "Gemini TTS не вернул аудио после 3 попыток. "
+                f"{detail}. Проверьте доступ к модели {self.tts_model} и лимиты; "
+                "при частых сбоях снизьте TTS_CONCURRENCY."
+            )
         try:
             audio = base64.b64decode(inline["data"], validate=True)
         except (ValueError, TypeError) as exc:
