@@ -501,26 +501,64 @@ def whisper_model():
         return _whisper_models[name]
 
 
+SENTENCE_END = (".", "!", "?", "…")
+CHUNK_MAX_SECONDS = 6.5   # не даём фразам-якорям быть слишком длинными
+CHUNK_GAP_SECONDS = 0.6   # пауза, по которой начинаем новую фразу
+
+
+def _clean_words(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+([,.!?…:;])", r"\1", text)
+
+
 def transcribe(audio: Path, language: str | None) -> list[dict[str, Any]]:
     segments_iterator, _ = whisper_model().transcribe(
         str(audio),
         language=language,
         beam_size=5,
         vad_filter=True,
+        word_timestamps=True,
         condition_on_previous_text=False,
     )
-    result: list[dict[str, Any]] = []
+
+    words: list[tuple[float, float, str]] = []
+    fallback: list[tuple[float, float, str]] = []
     for segment in segments_iterator:
-        text = segment.text.strip()
-        if text and segment.end > segment.start:
-            result.append(
-                {
-                    "index": len(result),
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "text": text,
-                }
-            )
+        seg_text = segment.text.strip()
+        if seg_text and segment.end > segment.start:
+            fallback.append((float(segment.start), float(segment.end), seg_text))
+        for word in getattr(segment, "words", None) or []:
+            token = (word.word or "").strip()
+            if token and word.end > word.start:
+                words.append((float(word.start), float(word.end), token))
+
+    result: list[dict[str, Any]] = []
+
+    def flush(chunk: list[tuple[float, float, str]]) -> None:
+        if not chunk:
+            return
+        text = _clean_words(" ".join(w[2] for w in chunk))
+        start, end = chunk[0][0], chunk[-1][1]
+        if text and end > start:
+            result.append({"index": len(result), "start": start, "end": end, "text": text})
+
+    if words:
+        # Пословные метки -> режем на фразы по паузам, концам предложений и длине.
+        chunk: list[tuple[float, float, str]] = []
+        for word_start, word_end, token in words:
+            if chunk:
+                gap = word_start - chunk[-1][1]
+                span = word_end - chunk[0][0]
+                prev_ends_sentence = chunk[-1][2].endswith(SENTENCE_END)
+                if gap > CHUNK_GAP_SECONDS or span > CHUNK_MAX_SECONDS or prev_ends_sentence:
+                    flush(chunk)
+                    chunk = []
+            chunk.append((word_start, word_end, token))
+        flush(chunk)
+    else:
+        for start, end, text in fallback:
+            result.append({"index": len(result), "start": start, "end": end, "text": text})
+
     if not result:
         raise RuntimeError("В видео не найдена речь")
     return result
