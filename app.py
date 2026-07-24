@@ -532,6 +532,28 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
+def trim_lead_silence(source: Path, output: Path) -> None:
+    """Убирает тишину/паузу в начале реплики, чтобы слова начинались сразу.
+
+    Gemini TTS иногда добавляет паузу перед речью — из-за неё вся озвучка съезжает
+    и звучит не вовремя. Обрезаем ведущую тишину, оставляя лишь 20 мс.
+    """
+    run_command(
+        [
+            "ffmpeg", "-y", "-i", str(source),
+            "-af", "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.02",
+            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
+        ],
+        timeout=120,
+    )
+    # Если после обрезки файл пустой (вся реплика тихая) — вернём исходный.
+    try:
+        if media_duration(output) < 0.05:
+            shutil.copyfile(source, output)
+    except RuntimeError:
+        shutil.copyfile(source, output)
+
+
 def _generate_segment(
     client: GeminiClient,
     segment: DubSegment,
@@ -540,20 +562,23 @@ def _generate_segment(
     segments_dir: Path,
 ) -> tuple[Path, str, str]:
     raw = segments_dir / f"{segment.index:04d}-raw.wav"
+    trimmed = segments_dir / f"{segment.index:04d}-trim.wav"
     fitted = segments_dir / f"{segment.index:04d}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
     client.tts(spoken_text, voice, raw, budget, segment.style)
+    trim_lead_silence(raw, trimmed)
     shorten_attempts = 0
     while (
-        media_duration(raw) > budget * 1.35
+        media_duration(trimmed) > budget * 1.35
         and len(spoken_text) > 12
         and shorten_attempts < 2
     ):
         spoken_text = client.shorten(spoken_text, budget)
         client.tts(spoken_text, voice, raw, budget, segment.style)
+        trim_lead_silence(raw, trimmed)
         shorten_attempts += 1
-    normalize_and_fit(raw, fitted, budget)
+    normalize_and_fit(trimmed, fitted, budget)
     return fitted, spoken_text, voice
 
 
