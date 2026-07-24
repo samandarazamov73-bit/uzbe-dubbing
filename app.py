@@ -28,6 +28,10 @@ Uzbek Video Dubbing — всё приложение в одном файле (п
   TTS_CONCURRENCY=4      # сколько реплик озвучивать параллельно
   PORT=8000
 
+Режим «Сохранить музыку» (убрать оригинальный голос, оставить фон) требует Demucs:
+  pip install demucs
+
+
 API-ключ намеренно не хранится в этом файле и не отправляется в браузер.
 """
 
@@ -72,7 +76,8 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.35  # предельное ускорение, только если реплика не влезает в паузу
+MAX_SPEED_UP_RATIO = 1.4  # предельное ускорение реплики
+MIN_SLOWDOWN_RATIO = 0.9  # предельное замедление (растяжение под окно оригинала)
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 
@@ -483,6 +488,43 @@ def extract_audio(video: Path, output: Path) -> None:
     )
 
 
+def extract_audio_hifi(video: Path, output: Path) -> None:
+    """Стерео 44.1 кГц — качество для разделения голоса и фона (Demucs)."""
+    run_command(
+        [
+            "ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "2", "-ar", "44100",
+            "-c:a", "pcm_s16le", str(output),
+        ]
+    )
+
+
+def separate_background(audio: Path, work_dir: Path) -> Path:
+    """Отделяет оригинальный голос от музыки/шумов и возвращает дорожку без голоса.
+
+    Использует Demucs (нужно установить: pip install demucs). Так оригинальную
+    речь можно полностью убрать, сохранив фоновую музыку и звуки.
+    """
+    try:
+        import demucs  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Для режима «Сохранить музыку» установите Demucs: pip install demucs"
+        ) from exc
+
+    out_dir = work_dir / "demucs"
+    run_command(
+        [
+            sys.executable, "-m", "demucs", "--two-stems=vocals",
+            "-o", str(out_dir), str(audio),
+        ],
+        timeout=3600,
+    )
+    matches = sorted(out_dir.rglob("no_vocals.wav"))
+    if not matches:
+        raise RuntimeError("Demucs не создал фоновую дорожку")
+    return matches[0]
+
+
 def whisper_model():
     name = os.getenv("WHISPER_MODEL", "medium")
     with _whisper_lock:
@@ -576,26 +618,33 @@ def atempo_filter(ratio: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
-def normalize_and_fit(source: Path, output: Path, budget_seconds: float) -> None:
-    """Подгоняет реплику под доступное время (до следующей реплики).
-
-    Используем паузу до следующей реплики как запас: ускоряем только если реплика
-    реально не влезает, и обрезаем лишь как крайнюю меру, чтобы не наезжать на
-    следующую реплику. Так слова не режутся и речь не тараторит.
-    """
+def normalize_and_fit(
+    source: Path, output: Path, target_seconds: float, max_seconds: float
+) -> None:
+    """Подгоняет длину реплики: target — окно оригинала, max — предел до следующей."""
     actual = media_duration(source)
+    # Подгоняем длину узбекской реплики под окно оригинала (target_seconds):
+    #  - если длиннее допустимого (max_seconds до следующей реплики) — ускоряем;
+    #  - если заметно короче окна оригинала — слегка растягиваем, чтобы совпадало
+    #    с движением губ и длиной исходной фразы.
+    ratio = 1.0
+    if actual > max_seconds * 1.02:
+        ratio = actual / max(max_seconds, 0.25)
+    elif actual < target_seconds * 0.92:
+        ratio = actual / max(target_seconds, 0.25)
+    ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), MAX_SPEED_UP_RATIO)
+
     chain: list[str] = []
-    if actual > budget_seconds * 1.02:
-        ratio = min(actual / max(budget_seconds, 0.25), MAX_SPEED_UP_RATIO)
+    if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
     # Микрофейды убирают щелчки в начале/конце реплики.
-    fade_out_start = max(0.0, budget_seconds - 0.04)
+    fade_out_start = max(0.0, max_seconds - 0.04)
     chain.append("afade=t=in:st=0:d=0.015")
     chain.append(f"afade=t=out:st={fade_out_start:.3f}:d=0.04")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
-            "-t", f"{budget_seconds:.3f}",
+            "-t", f"{max_seconds:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -660,7 +709,7 @@ def _generate_segment(
         client.tts(spoken_text, voice, raw, budget, segment.style, scene)
         trim_lead_silence(raw, trimmed)
         shorten_attempts += 1
-    normalize_and_fit(trimmed, fitted, budget)
+    normalize_and_fit(trimmed, fitted, segment.duration, budget)
     return fitted, spoken_text, voice
 
 
@@ -743,15 +792,31 @@ def render_timeline(
     return output
 
 
-def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
+def mux_video(
+    video: Path,
+    dubbed: Path,
+    output: Path,
+    mode: str,
+    background: Path | None = None,
+) -> None:
     should_mix = mode == "mix" and has_audio(video)
+    use_music = mode == "music" and background is not None
 
     # loudnorm выравнивает громкость узбекской озвучки до вещательного уровня.
     loudnorm = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
     def command(video_codec: list[str]) -> list[str]:
         base = ["ffmpeg", "-y", "-i", str(video), "-i", str(dubbed)]
-        if should_mix:
+        if use_music:
+            # Оригинальный голос убран, поверх фоновой музыки — узбекская озвучка.
+            base += ["-i", str(background)]
+            audio = [
+                "-filter_complex",
+                f"[1:a:0]{loudnorm}[dub];[2:a:0]aformat=channel_layouts=stereo[bg];"
+                "[bg][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
+                "-map", "0:v:0", "-map", "[aout]",
+            ]
+        elif should_mix:
             audio = [
                 "-filter_complex",
                 f"[1:a:0]{loudnorm}[dub];[0:a:0]volume=0.16[orig];"
@@ -814,8 +879,15 @@ def auto_dubbing_pipeline(
     finally:
         client.close()
 
-    progress(90, "Собирается готовое видео")
-    mux_video(input_path, dubbed, output_path, audio_mode)
+    background: Path | None = None
+    if audio_mode == "music":
+        progress(88, "Отделяется оригинальный голос от музыки")
+        hifi = work_dir / "source-hifi.wav"
+        extract_audio_hifi(input_path, hifi)
+        background = separate_background(hifi, work_dir)
+
+    progress(92, "Собирается готовое видео")
+    mux_video(input_path, dubbed, output_path, audio_mode, background)
     progress(98, "Проверяется результат")
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError("FFmpeg не создал итоговое видео")
@@ -913,7 +985,7 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Неподдерживаемый исходный язык")
     if female_voice not in VOICES or male_voice not in VOICES:
         raise HTTPException(status_code=400, detail="Неизвестный голос")
-    if audio_mode not in {"mix", "replace"}:
+    if audio_mode not in {"mix", "replace", "music"}:
         raise HTTPException(status_code=400, detail="Неизвестный режим звука")
 
     suffix = Path(video.filename or "video.mp4").suffix.lower()
@@ -1063,6 +1135,7 @@ footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
   <fieldset><legend>Оригинальный звук</legend>
     <label class="option"><input type="radio" name="audio_mode" value="mix" checked><span><strong>Тихий фон</strong><small>Оригинал на громкости 18%</small></span></label>
     <label class="option"><input type="radio" name="audio_mode" value="replace"><span><strong>Полная замена</strong><small>Только узбекская речь</small></span></label>
+    <label class="option"><input type="radio" name="audio_mode" value="music"><span><strong>Сохранить музыку</strong><small>Убрать оригинальный голос, оставить фон (нужен Demucs)</small></span></label>
   </fieldset>
 </div>
 </section>
