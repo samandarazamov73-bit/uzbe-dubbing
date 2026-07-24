@@ -1,5 +1,5 @@
 """
-Uzbek Video Dubbing — всё приложение в одном файле.
+Uzbek Video Dubbing — всё приложение в одном файле (полностью автоматический режим).
 
 Запуск (Python 3.11):
   1. Установите FFmpeg и убедитесь, что команды ffmpeg/ffprobe доступны.
@@ -10,12 +10,11 @@ Uzbek Video Dubbing — всё приложение в одном файле.
   4. python app.py
   5. Откройте http://localhost:8000
 
-Процесс работы:
-  1. Загружаете видео -> сервис распознаёт речь и делает черновой перевод.
-  2. Открывается таблица реплик: можно править перевод, задать интонацию
-     (стиль озвучки) и указать говорящего (мужчина/женщина) для каждой строки.
-  3. Нажимаете "Сгенерировать озвучку" -> голос подбирается по говорящему,
-     собирается готовое видео.
+Как работает (всё автоматически, править ничего не нужно):
+  Загружаете видео -> распознаётся речь -> Gemini переводит на узбекский,
+  сам определяет пол говорящего (голос переключается муж./жен.) и эмоцию каждой
+  реплики (злость, радость, крик и т.д.) -> голосом Gemini 3.1 создаётся озвучка
+  с нужной интонацией -> собирается готовое видео.
 
 Настройки окружения (необязательно):
   GEMINI_TEXT_MODEL=gemini-2.5-flash
@@ -55,7 +54,7 @@ from typing import Any, Callable
 
 import httpx
 import uvicorn
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 
@@ -72,7 +71,9 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
-MAX_STYLE_LEN = 400
+TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
+MAX_SPEED_UP_RATIO = 1.35  # предельное ускорение, только если реплика не влезает в паузу
+MAX_STYLE_LEN = 200
 
 VOICES = [
     "Kore", "Zephyr", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Aoede",
@@ -85,7 +86,7 @@ DEFAULT_FEMALE_VOICE = "Kore"
 DEFAULT_MALE_VOICE = "Charon"
 
 ProgressCallback = Callable[[int, str], None]
-app = FastAPI(title="Uzbek Video Dubbing", version="2.0.0")
+app = FastAPI(title="Uzbek Video Dubbing", version="3.0.0")
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dubbing")
@@ -105,7 +106,7 @@ class DubSegment:
     source_text: str
     translated_text: str
     speaker: str = "female"  # "female" | "male"
-    style: str = ""  # интонация/подсказка озвучки для этой реплики
+    style: str = ""  # авто-определённая эмоция/интонация реплики
 
     @property
     def duration(self) -> float:
@@ -205,18 +206,20 @@ class GeminiClient:
                 for item in batch
             ]
             prompt = (
-                "Ты профессиональный переводчик-дубляжист. Переведи реплики ниже на живой, "
-                "грамматически правильный разговорный узбекский язык ЛАТИНИЦЕЙ. Это "
-                "последовательные фразы одного видео — переводи их как связный текст, сохраняя "
-                "точный смысл, имена, числа и порядок реплик. Пиши естественно, как носитель "
-                "языка, а НЕ буквальным подстрочником. Поле duration_seconds — это лишь мягкая "
-                "подсказка по длине произношения: сокращай формулировку только если фраза "
-                "значительно длиннее, и никогда в ущерб грамматике и ясности. Дополнительно "
-                "определи по контексту пол говорящего в каждой реплике: \"male\" (мужчина) или "
-                "\"female\" (женщина). Не добавляй пояснений и комментариев. Верни только "
-                'JSON-массив вида '
-                '[{"id":0,"translated_text":"...","speaker":"male"}].\nРеплики:\n'
-                + json.dumps(source, ensure_ascii=False)
+                "Ты профессиональный режиссёр дубляжа. Для каждой реплики видео сделай три "
+                "вещи:\n"
+                "1) translated_text — живой, грамматически правильный перевод на разговорный "
+                "УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ. Переводи как связный текст, сохраняя смысл, имена и "
+                "числа, естественно, как носитель, а не подстрочником. duration_seconds — "
+                "мягкая подсказка по длине; сокращай только при сильном превышении и никогда в "
+                "ущерб смыслу.\n"
+                "2) speaker — пол говорящего по контексту: \"male\" или \"female\".\n"
+                "3) style — КОРОТКАЯ подсказка эмоции и подачи на английском (2-4 слова), "
+                "например \"angry, shouting\", \"soft and warm\", \"excited\", \"sad\", "
+                "\"sarcastic\", \"neutral calm\". Определи её по смыслу и тону реплики.\n"
+                "Верни только JSON-массив вида "
+                '[{"id":0,"translated_text":"...","speaker":"male","style":"angry, shouting"}].'
+                "\nРеплики:\n" + json.dumps(source, ensure_ascii=False)
             )
             data = self._post(
                 self.text_model,
@@ -244,6 +247,7 @@ class GeminiClient:
                 speaker = str(payload.get("speaker", "female")).strip().lower()
                 if speaker not in {"male", "female"}:
                     speaker = "female"
+                style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
                 translated.append(
                     DubSegment(
                         index=item["index"],
@@ -252,6 +256,7 @@ class GeminiClient:
                         source_text=item["text"],
                         translated_text=str(payload["translated_text"]).strip(),
                         speaker=speaker,
+                        style=style,
                     )
                 )
         return translated
@@ -279,9 +284,8 @@ class GeminiClient:
         output_path: Path,
         duration: float,
         style_note: str = "",
-        global_style: str = "",
     ) -> None:
-        directions = [part.strip() for part in (global_style, style_note) if part.strip()]
+        directions = style_note.strip()
         prompt = (
             "You are a professional Uzbek dubbing voice actor. Perform the line after MATN in "
             "fluent, natural, conversational Uzbek. Pronounce EVERY word fully and clearly — "
@@ -293,7 +297,7 @@ class GeminiClient:
             "read DIRECTION aloud and do not add any comments.\n"
         )
         if directions:
-            prompt += "DIRECTION: " + " | ".join(directions) + "\n"
+            prompt += f"DIRECTION: {directions}\n"
         prompt += f"MATN:\n{text}"
 
         data = self._post(
@@ -450,15 +454,12 @@ def atempo_filter(ratio: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
-MAX_SPEED_UP_RATIO = 1.35  # предельное ускорение, только если реплика не влезает в паузу
-
-
 def normalize_and_fit(source: Path, output: Path, budget_seconds: float) -> None:
     """Подгоняет реплику под доступное время (до следующей реплики).
 
-    Ключевая идея: НЕ режем по длине исходной фразы, а используем паузу до
-    следующей реплики как запас. Ускоряем только если реплика реально не влезает,
-    и обрезаем лишь как крайнюю меру, чтобы не наезжать на следующую реплику.
+    Используем паузу до следующей реплики как запас: ускоряем только если реплика
+    реально не влезает, и обрезаем лишь как крайнюю меру, чтобы не наезжать на
+    следующую реплику. Так слова не режутся и речь не тараторит.
     """
     actual = media_duration(source)
     filters: list[str] = []
@@ -485,24 +486,18 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
-TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-
-
 def _generate_segment(
     client: GeminiClient,
     segment: DubSegment,
     budget: float,
     voice_map: dict[str, str],
-    global_style: str,
     segments_dir: Path,
 ) -> tuple[Path, str, str]:
     raw = segments_dir / f"{segment.index:04d}-raw.wav"
     fitted = segments_dir / f"{segment.index:04d}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
-    client.tts(spoken_text, voice, raw, budget, segment.style, global_style)
-    # Сокращаем текст только если реплика намного длиннее доступной паузы —
-    # иначе слова обрезались бы. Порог по budget, а не по длине исходной фразы.
+    client.tts(spoken_text, voice, raw, budget, segment.style)
     shorten_attempts = 0
     while (
         media_duration(raw) > budget * 1.35
@@ -510,7 +505,7 @@ def _generate_segment(
         and shorten_attempts < 2
     ):
         spoken_text = client.shorten(spoken_text, budget)
-        client.tts(spoken_text, voice, raw, budget, segment.style, global_style)
+        client.tts(spoken_text, voice, raw, budget, segment.style)
         shorten_attempts += 1
     normalize_and_fit(raw, fitted, budget)
     return fitted, spoken_text, voice
@@ -521,7 +516,6 @@ def render_timeline(
     segments: list[DubSegment],
     client: GeminiClient,
     voice_map: dict[str, str],
-    global_style: str,
     work_dir: Path,
     progress: ProgressCallback,
 ) -> Path:
@@ -531,15 +525,12 @@ def render_timeline(
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
 
-    # Бюджет реплики — время до начала следующей реплики (включая паузу).
-    # Даёт запас, чтобы не резать слова и не ускорять речь без необходимости.
     ordered = sorted(segments, key=lambda s: s.start)
     budgets: dict[int, float] = {}
     for position, segment in enumerate(ordered):
         next_start = ordered[position + 1].start if position + 1 < len(ordered) else duration
         budgets[segment.index] = max(0.5, next_start - segment.start - 0.03)
 
-    # Генерируем реплики параллельно — это кратно быстрее строго последовательной озвучки.
     generated: dict[int, tuple[Path, str, str]] = {}
     total = len(segments)
     done = 0
@@ -552,7 +543,6 @@ def render_timeline(
                 segment,
                 budgets[segment.index],
                 voice_map,
-                global_style,
                 segments_dir,
             ): segment
             for segment in segments
@@ -561,12 +551,9 @@ def render_timeline(
             segment = futures[future]
             generated[segment.index] = future.result()
             done += 1
-            progress(
-                45 + round(done / total * 40),
-                f"Озвучено {done} из {total} реплик",
-            )
+            progress(45 + round(done / total * 40), f"Озвучено {done} из {total} реплик")
 
-    for segment in segments:
+    for segment in ordered:
         fitted, spoken_text, voice = generated[segment.index]
         clip = read_mono_pcm(fitted)
         start_sample = max(0, int(segment.start * sample_rate))
@@ -574,7 +561,6 @@ def render_timeline(
         for index in range(available):
             mixed = timeline[start_sample + index] + clip[index]
             timeline[start_sample + index] = max(-32768, min(32767, mixed))
-
         transcript.append(
             {
                 "start": round(segment.start, 3),
@@ -629,123 +615,79 @@ def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Фаза 1: распознавание + черновой перевод
+# Полностью автоматический процесс дубляжа
 # -----------------------------------------------------------------------------
 
-def transcribe_pipeline(
+def auto_dubbing_pipeline(
     input_path: Path,
+    output_path: Path,
     language: str | None,
+    voice_map: dict[str, str],
+    audio_mode: str,
     progress: ProgressCallback,
-) -> tuple[float, list[DubSegment]]:
-    progress(8, "Проверяется видео")
+) -> None:
+    work_dir = input_path.parent
+    progress(5, "Проверяется видео")
     duration = media_duration(input_path)
     if duration > MAX_VIDEO_MINUTES * 60:
         raise RuntimeError(f"Видео длиннее лимита {MAX_VIDEO_MINUTES} минут")
     if not has_audio(input_path):
         raise RuntimeError("В видео нет аудиодорожки")
 
-    source_audio = input_path.parent / "source.wav"
-    progress(20, "Извлекается аудио")
+    source_audio = work_dir / "source.wav"
+    progress(12, "Извлекается аудио")
     extract_audio(input_path, source_audio)
-    progress(35, "Распознаётся речь")
+    progress(24, "Распознаётся речь")
     source_segments = transcribe(source_audio, language)
 
     client = GeminiClient()
     try:
-        progress(70, f"Черновой перевод {len(source_segments)} реплик")
+        progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments)
+        progress(45, "Создаётся узбекская озвучка")
+        dubbed = render_timeline(duration, translated, client, voice_map, work_dir, progress)
     finally:
         client.close()
-    return duration, translated
+
+    progress(90, "Собирается готовое видео")
+    mux_video(input_path, dubbed, output_path, audio_mode)
+    progress(98, "Проверяется результат")
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg не создал итоговое видео")
+    media_duration(output_path)
 
 
-def transcribe_job(job_id: str, input_path: Path, language: str | None) -> None:
+def process_job(
+    job_id: str,
+    input_path: Path,
+    language: str | None,
+    voice_map: dict[str, str],
+    audio_mode: str,
+) -> None:
+    output_path = input_path.parent / "uzbek-dubbed.mp4"
+
     def progress(percent: int, message: str) -> None:
         update_job(job_id, status="processing", progress=percent, message=message)
 
     try:
-        duration, segments = transcribe_pipeline(input_path, language, progress)
+        auto_dubbing_pipeline(input_path, output_path, language, voice_map, audio_mode, progress)
         update_job(
             job_id,
-            status="review",
+            status="completed",
             progress=100,
-            message="Черновик готов — проверьте перевод",
-            duration=duration,
-            segments=[segment_to_dict(s) for s in segments],
+            message="Дубляж готов",
+            result_path=str(output_path),
         )
     except Exception as exc:
         update_job(job_id, status="failed", message="Не удалось обработать видео", error=str(exc))
 
 
 # -----------------------------------------------------------------------------
-# Фаза 2: озвучка отредактированных реплик + сборка
-# -----------------------------------------------------------------------------
-
-def render_job(
-    job_id: str,
-    input_path: Path,
-    duration: float,
-    segments: list[DubSegment],
-    voice_map: dict[str, str],
-    global_style: str,
-    audio_mode: str,
-) -> None:
-    output_path = input_path.parent / "uzbek-dubbed.mp4"
-
-    def progress(percent: int, message: str) -> None:
-        update_job(job_id, status="rendering", progress=percent, message=message)
-
-    client = GeminiClient()
-    try:
-        progress(40, "Начинается генерация узбекского голоса")
-        dubbed = render_timeline(
-            duration, segments, client, voice_map, global_style, input_path.parent, progress
-        )
-    except Exception as exc:
-        client.close()
-        update_job(job_id, status="failed", message="Не удалось озвучить видео", error=str(exc))
-        return
-    else:
-        client.close()
-
-    try:
-        progress(90, "Собирается готовое видео")
-        mux_video(input_path, dubbed, output_path, audio_mode)
-        progress(98, "Проверяется результат")
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise RuntimeError("FFmpeg не создал итоговое видео")
-        media_duration(output_path)
-    except Exception as exc:
-        update_job(job_id, status="failed", message="Не удалось собрать видео", error=str(exc))
-        return
-
-    update_job(
-        job_id,
-        status="completed",
-        progress=100,
-        message="Дубляж готов",
-        result_path=str(output_path),
-    )
-
-
-# -----------------------------------------------------------------------------
 # Очередь и HTTP API
 # -----------------------------------------------------------------------------
 
-def segment_to_dict(segment: DubSegment) -> dict[str, Any]:
-    return {
-        "index": segment.index,
-        "start": round(segment.start, 3),
-        "end": round(segment.end, 3),
-        "source_text": segment.source_text,
-        "translated_text": segment.translated_text,
-        "speaker": segment.speaker,
-        "style": segment.style,
-    }
-
-
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
-    data = {
+    return {
         "id": job["id"],
         "status": job["status"],
         "progress": job["progress"],
@@ -753,9 +695,6 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "error": job.get("error"),
         "result_url": f"/api/jobs/{job['id']}/result" if job["status"] == "completed" else None,
     }
-    if job["status"] == "review":
-        data["segments"] = job.get("segments", [])
-    return data
 
 
 def update_job(job_id: str, **changes: Any) -> None:
@@ -799,11 +738,18 @@ def list_voices() -> dict[str, Any]:
 async def create_job(
     video: UploadFile = File(...),
     source_language: str = Form("auto"),
+    female_voice: str = Form(DEFAULT_FEMALE_VOICE),
+    male_voice: str = Form(DEFAULT_MALE_VOICE),
+    audio_mode: str = Form("mix"),
 ) -> dict[str, Any]:
     if not os.getenv("GEMINI_API_KEY", "").strip():
         raise HTTPException(status_code=503, detail="На сервере не задан GEMINI_API_KEY")
     if source_language not in {"auto", "ru", "en", "uz"}:
         raise HTTPException(status_code=400, detail="Неподдерживаемый исходный язык")
+    if female_voice not in VOICES or male_voice not in VOICES:
+        raise HTTPException(status_code=400, detail="Неизвестный голос")
+    if audio_mode not in {"mix", "replace"}:
+        raise HTTPException(status_code=400, detail="Неизвестный режим звука")
 
     suffix = Path(video.filename or "video.mp4").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -840,103 +786,18 @@ async def create_job(
         "message": "Видео добавлено в очередь",
         "error": None,
         "result_path": None,
-        "input_path": str(input_path),
-        "duration": 0.0,
-        "segments": [],
     }
     with _jobs_lock:
         _jobs[job_id] = job
     _executor.submit(
-        transcribe_job,
+        process_job,
         job_id,
         input_path,
         None if source_language == "auto" else source_language,
-    )
-    return public_job(job)
-
-
-@app.post("/api/jobs/{job_id}/render", status_code=202)
-def start_render(job_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Задача не найдена")
-        if job["status"] not in {"review", "failed"}:
-            raise HTTPException(status_code=409, detail="Видео сейчас нельзя озвучить")
-        stored = {s["index"]: s for s in job.get("segments", [])}
-        input_path = Path(job["input_path"])
-        duration = float(job.get("duration", 0.0))
-
-    if not stored or duration <= 0:
-        raise HTTPException(status_code=409, detail="Нет реплик для озвучки")
-
-    female_voice = str(payload.get("female_voice", DEFAULT_FEMALE_VOICE))
-    male_voice = str(payload.get("male_voice", DEFAULT_MALE_VOICE))
-    if female_voice not in VOICES or male_voice not in VOICES:
-        raise HTTPException(status_code=400, detail="Неизвестный голос")
-    audio_mode = str(payload.get("audio_mode", "mix"))
-    if audio_mode not in {"mix", "replace"}:
-        raise HTTPException(status_code=400, detail="Неизвестный режим звука")
-    global_style = str(payload.get("global_style", ""))[:MAX_STYLE_LEN]
-
-    incoming = payload.get("segments")
-    if not isinstance(incoming, list) or not incoming:
-        raise HTTPException(status_code=400, detail="Нет реплик для озвучки")
-
-    segments: list[DubSegment] = []
-    for item in incoming:
-        if not isinstance(item, dict) or "index" not in item:
-            continue
-        try:
-            index = int(item["index"])
-        except (TypeError, ValueError):
-            continue
-        base = stored.get(index)
-        if not base:
-            continue
-        translated = str(item.get("translated_text", base["translated_text"])).strip()
-        if not translated:
-            continue
-        speaker = str(item.get("speaker", base["speaker"])).strip().lower()
-        if speaker not in {"male", "female"}:
-            speaker = "female"
-        style = str(item.get("style", ""))[:MAX_STYLE_LEN].strip()
-        segments.append(
-            DubSegment(
-                index=index,
-                start=float(base["start"]),
-                end=float(base["end"]),
-                source_text=base["source_text"],
-                translated_text=translated,
-                speaker=speaker,
-                style=style,
-            )
-        )
-
-    if not segments:
-        raise HTTPException(status_code=400, detail="Все реплики пустые")
-    segments.sort(key=lambda s: s.start)
-
-    update_job(
-        job_id,
-        status="rendering",
-        progress=5,
-        message="Озвучка поставлена в очередь",
-        error=None,
-        result_path=None,
-    )
-    _executor.submit(
-        render_job,
-        job_id,
-        input_path,
-        duration,
-        segments,
         {"female": female_voice, "male": male_voice},
-        global_style,
         audio_mode,
     )
-    with _jobs_lock:
-        return public_job(_jobs[job_id])
+    return public_job(job)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -973,97 +834,76 @@ def shutdown() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Весь frontend: HTML + CSS + JavaScript
+# Весь frontend: HTML + CSS + JavaScript (одна кнопка, всё автоматически)
 # -----------------------------------------------------------------------------
 
 HTML_PAGE = r'''<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ovoz — дубляж на узбекский</title>
+<title>Ovoz — авто-дубляж на узбекский</title>
 <style>
 :root{--bg:#12121a;--raised:#1a1a24;--panel:#1e1e2a;--line:#30303f;--text:#ede9e3;--dim:#9292a1;--gold:#d4a574;--red:#c85049}
 *{box-sizing:border-box}html,body{margin:0;min-height:100%}
 body{background:radial-gradient(ellipse 900px 520px at 15% -10%,rgba(212,165,116,.1),transparent 60%),var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;padding:46px 20px 80px}
-.wrap{width:min(100%,960px);margin:auto}
+.wrap{width:min(100%,820px);margin:auto}
 header{margin-bottom:36px}
 .eyebrow{color:var(--gold);font-size:11px;letter-spacing:.18em;text-transform:uppercase;display:flex;align-items:center;gap:10px}
 .eyebrow:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red)}
-h1{font-family:Georgia,serif;font-size:clamp(34px,6vw,54px);line-height:1;letter-spacing:-.025em;margin:13px 0;font-weight:600}
+h1{font-family:Georgia,serif;font-size:clamp(36px,7vw,58px);line-height:1;letter-spacing:-.025em;margin:13px 0;font-weight:600}
 h1 em{color:var(--gold);font-weight:500}
 .sub{color:var(--dim);max-width:640px;font-size:14px;line-height:1.7}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:24px;margin-bottom:18px}
 .title{margin:0 0 17px;color:var(--dim);font-size:11px;letter-spacing:.14em;text-transform:uppercase;display:flex;justify-content:space-between;gap:16px}
-.drop{min-height:150px;border:1px dashed #48485a;background:var(--raised);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;text-align:center;padding:24px}
+.drop{min-height:170px;border:1px dashed #48485a;background:var(--raised);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;text-align:center;padding:24px}
 .drop:hover,.drop.drag{border-color:var(--gold);background:rgba(212,165,116,.06)}
 .drop input{display:none}.plus{color:var(--gold);font-size:28px}.drop strong{font-size:14px}
 .drop small,.option small,.hint{display:block;color:var(--dim);font-size:11px;line-height:1.5}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 label,legend{color:var(--dim);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
-select,input[type=text],textarea{width:100%;margin-top:8px;background:var(--raised);border:1px solid var(--line);color:var(--text);font:13px ui-monospace,monospace;padding:11px;border-radius:3px;outline:none}
-select:focus,input:focus,textarea:focus{border-color:var(--gold)}
-textarea{resize:vertical;line-height:1.5}
+select{width:100%;margin-top:8px;background:var(--raised);border:1px solid var(--line);color:var(--text);font:13px ui-monospace,monospace;padding:12px;border-radius:3px;outline:none}
+select:focus{border-color:var(--gold)}
 fieldset{border:0;padding:0;margin:22px 0 0}legend{margin-bottom:9px}
 .option{display:flex;align-items:center;gap:10px;background:var(--raised);border:1px solid var(--line);padding:12px;margin-top:8px;cursor:pointer}
 .option:has(input:checked){border-color:var(--gold)}.option input{accent-color:var(--gold);width:auto;margin:0}
 .option span{display:flex;align-items:baseline;justify-content:space-between;width:100%;gap:16px}.option strong{color:var(--text);font-size:12px}
-.primary,.download,.ghost{display:block;width:100%;border:0;border-radius:3px;background:var(--gold);color:#12121a;padding:16px;font:700 12px ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;text-align:center;cursor:pointer;text-decoration:none}
+.primary,.download{display:block;width:100%;border:0;border-radius:3px;background:var(--gold);color:#12121a;padding:16px;font:700 12px ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;text-align:center;cursor:pointer;text-decoration:none}
 .primary:disabled{background:var(--line);color:var(--dim);cursor:wait}
-.ghost{background:transparent;border:1px solid var(--line);color:var(--dim);margin-top:10px}
+.adv{margin-top:14px;color:var(--dim);font-size:11px;cursor:pointer;text-decoration:underline}
 .error{color:#ee736c;font-size:12px;line-height:1.6;display:none;margin-top:12px}.error.show{display:block}
-.progress,.result{margin-top:0}
+.progress,.result{margin-top:18px}
 .head{display:flex;align-items:center;justify-content:space-between;font-size:12px}
 .dot{display:inline-block;width:8px;height:8px;background:var(--red);border-radius:50%;margin-right:10px;box-shadow:0 0 8px var(--red);animation:pulse 1.2s infinite}
 .track{height:5px;background:var(--raised);margin:17px 0 10px;overflow:hidden}.bar{width:0;height:100%;background:var(--gold);transition:width .35s}
 video{display:block;width:100%;max-height:460px;background:#08080c;margin-bottom:16px}
 footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
 @keyframes pulse{50%{opacity:.35}}
-.seg{border:1px solid var(--line);border-radius:4px;padding:14px;margin-top:12px;background:var(--raised)}
-.seg-top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px}
-.time{color:var(--gold);font-size:11px}
-.orig{color:var(--dim);font-size:12px;line-height:1.5;margin:0 0 10px;font-style:italic}
-.seg-row{display:grid;grid-template-columns:150px 1fr;gap:12px;margin-top:10px}
-.spk{display:inline-flex;gap:6px}
-.spk button{flex:1;border:1px solid var(--line);background:var(--panel);color:var(--dim);font:600 11px ui-monospace,monospace;padding:9px;border-radius:3px;cursor:pointer;text-transform:uppercase}
-.spk button.on{border-color:var(--gold);color:var(--gold);background:rgba(212,165,116,.08)}
-@media(max-width:640px){body{padding:30px 14px 60px}.panel{padding:18px}.grid,.seg-row{grid-template-columns:1fr}.option span{display:block}.limit{display:none}}
+@media(max-width:620px){body{padding:30px 14px 60px}.panel{padding:18px}.grid{grid-template-columns:1fr}.option span{display:block}.limit{display:none}}
 </style>
 </head><body><main class="wrap">
-<header><p class="eyebrow">Gemini TTS · Uzbek dubbing</p><h1>Видео говорит <em>по-узбекски</em>.</h1><p class="sub">Загрузите видео — сервис распознает речь и сделает черновой перевод. Затем вы отредактируете перевод, зададите интонацию и говорящего для каждой реплики.</p></header>
+<header><p class="eyebrow">Gemini 3.1 TTS · Uzbek dubbing</p><h1>Видео говорит <em>по-узбекски</em>.</h1><p class="sub">Загрузите видео — всё остальное автоматически: распознавание речи, перевод, определение говорящего (мужской/женский голос) и эмоции каждой реплики. Ничего править не нужно.</p></header>
 
 <form id="form">
 <section class="panel"><p class="title"><span>01 · Видео</span><span class="limit">до __MAX_MB__ МБ · __MAX_MINUTES__ минут</span></p>
 <label class="drop" id="drop" for="video"><input id="video" name="video" type="file" accept="video/mp4,video/quicktime,video/webm,.mkv" required><span class="plus">＋</span><strong id="fileName">Выберите видео</strong><small id="fileMeta">MP4, MOV, WEBM или MKV</small></label>
 <div style="margin-top:16px"><label for="lang">Исходный язык</label>
-<select id="lang" name="source_language"><option value="auto">Определить автоматически</option><option value="ru">Русский</option><option value="en">Английский</option><option value="uz">Узбекский</option></select></div></section>
-<button class="primary" id="submit" type="submit">Распознать и перевести</button><p class="error" id="error" role="alert"></p></form>
+<select id="lang" name="source_language"><option value="auto">Определить автоматически</option><option value="ru">Русский</option><option value="en">Английский</option><option value="uz">Узбекский</option></select></div>
+
+<p class="adv" id="advToggle">Дополнительно: выбрать голоса и звук ▾</p>
+<div id="advBox" hidden>
+  <div class="grid" style="margin-top:6px">
+    <div><label for="femaleVoice">Женский голос</label><select id="femaleVoice" name="female_voice"></select></div>
+    <div><label for="maleVoice">Мужской голос</label><select id="maleVoice" name="male_voice"></select></div>
+  </div>
+  <fieldset><legend>Оригинальный звук</legend>
+    <label class="option"><input type="radio" name="audio_mode" value="mix" checked><span><strong>Тихий фон</strong><small>Оригинал на громкости 18%</small></span></label>
+    <label class="option"><input type="radio" name="audio_mode" value="replace"><span><strong>Полная замена</strong><small>Только узбекская речь</small></span></label>
+  </fieldset>
+</div>
+</section>
+<button class="primary" id="submit" type="submit">Создать узбекский дубляж</button><p class="error" id="error" role="alert"></p></form>
 
 <section class="panel progress" id="progress" hidden><div class="head"><div><span class="dot"></span><span id="status">Подготовка…</span></div><strong id="percent">0%</strong></div><div class="track"><div class="bar" id="bar"></div></div><p class="hint">Не закрывайте страницу до окончания обработки.</p></section>
-
-<section id="editor" hidden>
-  <section class="panel">
-    <p class="title">02 · Голоса и интонация</p>
-    <div class="grid">
-      <div><label for="femaleVoice">Женский голос</label><select id="femaleVoice"></select></div>
-      <div><label for="maleVoice">Мужской голос</label><select id="maleVoice"></select></div>
-    </div>
-    <div style="margin-top:16px"><label for="globalStyle">Общий стиль озвучки (для всех реплик)</label>
-    <textarea id="globalStyle" rows="2" placeholder="напр.: живо и эмоционально, как в кино"></textarea></div>
-    <fieldset><legend>Оригинальный звук</legend>
-      <label class="option"><input type="radio" name="audio_mode" value="mix" checked><span><strong>Тихий фон</strong><small>Оригинал на громкости 18%</small></span></label>
-      <label class="option"><input type="radio" name="audio_mode" value="replace"><span><strong>Полная замена</strong><small>Только узбекская речь</small></span></label>
-    </fieldset>
-  </section>
-  <section class="panel">
-    <p class="title"><span>03 · Реплики</span><span class="limit" id="segCount"></span></p>
-    <p class="hint" style="margin:0 0 6px">Правьте перевод, укажите говорящего (Ж/М) и при необходимости интонацию — напр. «кричит со злостью», «шепчет», «радостно».</p>
-    <div id="segments"></div>
-  </section>
-  <button class="primary" id="renderBtn" type="button">Сгенерировать озвучку</button>
-  <div id="renderProgress" hidden><div class="head"><div><span class="dot"></span><span id="renderStatus">Озвучка…</span></div><strong id="renderPercent">0%</strong></div><div class="track"><div class="bar" id="renderBar"></div></div></div>
-  <button class="ghost" id="resetBtn" type="button">Загрузить другое видео</button>
-  <p class="error" id="editorError" role="alert"></p>
-</section>
 
 <section class="panel result" id="result" hidden><p class="title">Готовый дубляж</p><video id="player" controls playsinline></video><a class="download" id="download" download="uzbek-dubbed.mp4">Скачать видео</a></section>
 <footer>Gemini API key хранится только на сервере · файлы удаляются через 24 часа</footer></main>
@@ -1073,14 +913,13 @@ const VOICES=__VOICES__,DEF_FEMALE="__FEMALE__",DEF_MALE="__MALE__";
 const $=s=>document.querySelector(s);
 const form=$('#form'),video=$('#video'),drop=$('#drop'),fileName=$('#fileName'),fileMeta=$('#fileMeta'),submit=$('#submit'),error=$('#error');
 const progress=$('#progress'),bar=$('#bar'),percent=$('#percent'),statusText=$('#status');
-const editor=$('#editor'),segmentsBox=$('#segments'),segCount=$('#segCount'),renderBtn=$('#renderBtn'),resetBtn=$('#resetBtn'),editorError=$('#editorError');
-const femaleVoice=$('#femaleVoice'),maleVoice=$('#maleVoice'),globalStyle=$('#globalStyle');
-const renderProgress=$('#renderProgress'),renderBar=$('#renderBar'),renderPercent=$('#renderPercent'),renderStatus=$('#renderStatus');
+const advToggle=$('#advToggle'),advBox=$('#advBox'),femaleVoice=$('#femaleVoice'),maleVoice=$('#maleVoice');
 const result=$('#result'),player=$('#player'),download=$('#download');
-let timer=null,jobId=null,segData=[];
+let timer=null;
 
-VOICES.forEach(v=>{const a=new Option(v,v),b=new Option(v,v);femaleVoice.add(a);maleVoice.add(b);});
+VOICES.forEach(v=>{femaleVoice.add(new Option(v,v));maleVoice.add(new Option(v,v));});
 femaleVoice.value=DEF_FEMALE;maleVoice.value=DEF_MALE;
+advToggle.onclick=()=>{advBox.hidden=!advBox.hidden;advToggle.textContent=(advBox.hidden?'Дополнительно: выбрать голоса и звук ▾':'Скрыть дополнительно ▴')};
 
 const size=n=>n<1048576?`${(n/1024).toFixed(0)} КБ`:`${(n/1048576).toFixed(1)} МБ`;
 function showFile(f){if(f){fileName.textContent=f.name;fileMeta.textContent=size(f.size)}}
@@ -1089,95 +928,35 @@ video.onchange=()=>showFile(video.files[0]);
 ['dragleave','drop'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove('drag')}));
 drop.addEventListener('drop',e=>{if(e.dataTransfer.files.length){video.files=e.dataTransfer.files;showFile(video.files[0])}});
 
-function fail(box,m){box.textContent=m;box.classList.add('show')}
-function clearErr(box){box.textContent='';box.classList.remove('show')}
-function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
+function fail(m){error.textContent=m;error.classList.add('show')}
+function clearErr(){error.textContent='';error.classList.remove('show')}
 function update(j){progress.hidden=false;const p=Math.max(0,Math.min(100,Number(j.progress)||0));bar.style.width=p+'%';percent.textContent=p+'%';statusText.textContent=j.message||'Обработка…'}
-function updateRender(j){renderProgress.hidden=false;const p=Math.max(0,Math.min(100,Number(j.progress)||0));renderBar.style.width=p+'%';renderPercent.textContent=p+'%';renderStatus.textContent=j.message||'Озвучка…'}
 async function parse(r){const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||`Ошибка HTTP ${r.status}`);return d}
-function fmtTime(t){const m=Math.floor(t/60),s=Math.floor(t%60);return `${m}:${String(s).padStart(2,'0')}`}
 
-function renderSegments(){
-  segmentsBox.innerHTML='';
-  segCount.textContent=segData.length+' реплик';
-  segData.forEach(seg=>{
-    const el=document.createElement('div');el.className='seg';
-    el.innerHTML=
-      `<div class="seg-top"><span class="time">${fmtTime(seg.start)} – ${fmtTime(seg.end)}</span></div>`+
-      `<p class="orig">${esc(seg.source_text)}</p>`+
-      `<label>Перевод (узбекский)</label><textarea rows="2" data-f="translated_text">${esc(seg.translated_text)}</textarea>`+
-      `<div class="seg-row"><div><label>Говорящий</label><div class="spk">`+
-        `<button type="button" data-spk="female">Женский</button>`+
-        `<button type="button" data-spk="male">Мужской</button></div></div>`+
-      `<div><label>Интонация (необязательно)</label><input type="text" data-f="style" placeholder="напр.: кричит со злостью" value="${esc(seg.style)}"></div></div>`;
-    el.querySelector('[data-f="translated_text"]').oninput=e=>seg.translated_text=e.target.value;
-    el.querySelector('[data-f="style"]').oninput=e=>seg.style=e.target.value;
-    const btns=el.querySelectorAll('[data-spk]');
-    const paint=()=>btns.forEach(b=>b.classList.toggle('on',b.dataset.spk===seg.speaker));
-    btns.forEach(b=>b.onclick=()=>{seg.speaker=b.dataset.spk;paint()});
-    paint();
-    segmentsBox.appendChild(el);
-  });
-}
-
-async function pollTranscribe(id){
+async function poll(id){
   try{
     const j=await parse(await fetch(`/api/jobs/${id}`));update(j);
-    if(j.status==='review'){
-      progress.hidden=true;segData=j.segments||[];renderSegments();
-      editor.hidden=false;editor.scrollIntoView({behavior:'smooth'});
-      submit.disabled=false;submit.textContent='Распознать и перевести';return;
-    }
-    if(j.status==='failed'){submit.disabled=false;submit.textContent='Попробовать снова';fail(error,j.error||'Ошибка');return}
-    timer=setTimeout(()=>pollTranscribe(id),1500);
-  }catch(e){submit.disabled=false;fail(error,e.message)}
-}
-
-async function pollRender(id){
-  try{
-    const j=await parse(await fetch(`/api/jobs/${id}`));updateRender(j);
     if(j.status==='completed'){
-      renderProgress.hidden=true;renderBtn.disabled=false;renderBtn.textContent='Сгенерировать заново';
+      submit.disabled=false;submit.textContent='Создать ещё один дубляж';progress.hidden=true;
       const url=j.result_url+'?t='+Date.now();player.src=url;download.href=url;
       result.hidden=false;result.scrollIntoView({behavior:'smooth'});return;
     }
-    if(j.status==='failed'){renderBtn.disabled=false;renderBtn.textContent='Попробовать снова';renderProgress.hidden=true;fail(editorError,j.error||'Ошибка озвучки');return}
-    timer=setTimeout(()=>pollRender(id),1500);
-  }catch(e){renderBtn.disabled=false;fail(editorError,e.message)}
+    if(j.status==='failed'){submit.disabled=false;submit.textContent='Попробовать снова';progress.hidden=true;fail(j.error||'Не удалось создать дубляж');return}
+    timer=setTimeout(()=>poll(id),1500);
+  }catch(e){submit.disabled=false;fail(e.message)}
 }
 
 form.onsubmit=async e=>{
-  e.preventDefault();clearErr(error);editor.hidden=true;result.hidden=true;
-  player.removeAttribute('src');player.load();
-  if(!video.files.length){fail(error,'Выберите видео');return}
+  e.preventDefault();clearErr();result.hidden=true;player.removeAttribute('src');player.load();
+  if(!video.files.length){fail('Выберите видео');return}
   if(timer)clearTimeout(timer);
   submit.disabled=true;submit.textContent='Загрузка видео…';
   update({progress:1,message:'Видео загружается на сервер'});
   try{
     const j=await parse(await fetch('/api/jobs',{method:'POST',body:new FormData(form)}));
-    submit.textContent='Распознаётся…';update(j);pollTranscribe(j.id);jobId=j.id;
-  }catch(e){submit.disabled=false;submit.textContent='Распознать и перевести';fail(error,e.message)}
+    submit.textContent='Создаётся дубляж…';update(j);poll(j.id);
+  }catch(e){submit.disabled=false;submit.textContent='Создать узбекский дубляж';fail(e.message)}
 };
-
-renderBtn.onclick=async()=>{
-  clearErr(editorError);result.hidden=true;player.removeAttribute('src');player.load();
-  if(!segData.some(s=>s.translated_text.trim())){fail(editorError,'Заполните перевод хотя бы одной реплики');return}
-  if(timer)clearTimeout(timer);
-  renderBtn.disabled=true;renderBtn.textContent='Озвучивается…';
-  updateRender({progress:5,message:'Озвучка ставится в очередь'});
-  const body={
-    female_voice:femaleVoice.value,male_voice:maleVoice.value,
-    audio_mode:document.querySelector('input[name=audio_mode]:checked').value,
-    global_style:globalStyle.value,
-    segments:segData.map(s=>({index:s.index,translated_text:s.translated_text,speaker:s.speaker,style:s.style}))
-  };
-  try{
-    const j=await parse(await fetch(`/api/jobs/${jobId}/render`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
-    update(j);pollRender(jobId);
-  }catch(e){renderBtn.disabled=false;renderBtn.textContent='Сгенерировать озвучку';fail(editorError,e.message)}
-};
-
-resetBtn.onclick=()=>{if(timer)clearTimeout(timer);editor.hidden=true;result.hidden=true;progress.hidden=true;segData=[];jobId=null;window.scrollTo({top:0,behavior:'smooth'})};
 </script></body></html>'''
 
 
