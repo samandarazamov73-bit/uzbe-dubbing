@@ -73,7 +73,8 @@ JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
 MAX_SPEED_UP_RATIO = 1.35  # предельное ускорение, только если реплика не влезает в паузу
-MAX_STYLE_LEN = 200
+MAX_STYLE_LEN = 400
+MAX_SCENE_LEN = 1200
 
 VOICES = [
     "Kore", "Zephyr", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Aoede",
@@ -193,29 +194,61 @@ class GeminiClient:
         except json.JSONDecodeError as exc:
             raise RuntimeError("Gemini вернул некорректный JSON перевода") from exc
 
+    def analyze_scene(self, segments: list[dict[str, Any]]) -> str:
+        """Просит Gemini понять сцену целиком: место, отношения, характеры, настроение.
+
+        Этот «режиссёрский разбор» затем подмешивается в перевод и озвучку, чтобы
+        актёры играли, а не читали ровным тоном.
+        """
+        script = "\n".join(f"[{s['index']}] {s['text']}" for s in segments)[:6000]
+        prompt = (
+            "You are a film dubbing director. Read this dialogue transcript and briefly analyze "
+            "the scene so voice actors can perform it naturally. In 4-6 short sentences describe: "
+            "the setting and situation, the relationship between the speakers, and the distinct "
+            "personality, mood and vocal energy of EACH speaker (how they should sound — e.g. "
+            "flustered and defensive, or cocky and pushy). Be concrete and vivid. Reply in "
+            "English, plain text only.\n\nTRANSCRIPT:\n" + script
+        )
+        try:
+            data = self._post(
+                self.text_model,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generation_config": {"temperature": 0.5},
+                },
+            )
+            return self._response_text(data).strip()[:MAX_SCENE_LEN]
+        except RuntimeError:
+            return ""  # разбор необязателен — при сбое продолжаем без него
+
     def _translate_batch(
         self,
         context_lines: str,
+        scene: str,
         target: list[dict[str, Any]],
         results: dict[int, dict[str, Any]],
     ) -> None:
         target_ids = [item["index"] for item in target]
+        scene_block = f"SCENE BRIEF (для тона и характеров):\n{scene}\n\n" if scene else ""
         prompt = (
-            "Ты профессиональный режиссёр дубляжа. Ниже CONTEXT — весь скрипт видео "
-            "по порядку (для связности перевода, согласованности имён, терминов, тона и "
-            "местоимений). Переведи ТОЛЬКО реплики, чьи id указаны в TARGET.\n"
-            "Для каждой целевой реплики верни три поля:\n"
-            "1) translated_text — живой, грамматически правильный перевод на разговорный "
-            "УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ; естественно, как носитель, а не подстрочник; сохраняй "
-            "смысл, имена и числа. duration_seconds — мягкая подсказка по длине, сокращай "
-            "только при сильном превышении и никогда в ущерб смыслу.\n"
+            "Ты режиссёр дубляжа и переводчик. Ниже SCENE BRIEF (разбор сцены) и CONTEXT — "
+            "весь скрипт по порядку. Переведи ТОЛЬКО реплики с id из TARGET, играя сцену.\n"
+            "Для каждой целевой реплики верни поля:\n"
+            "1) translated_text — ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ. Пиши так, "
+            "как реально говорят люди в этой ситуации: с эмоцией, разговорными частицами и "
+            "интонацией персонажа (не сухой подстрочник, но сохраняй смысл, имена, числа). "
+            "duration_seconds — мягкая подсказка по длине.\n"
             '2) speaker — пол говорящего: "male" или "female".\n'
-            "3) style — КОРОТКАЯ эмоция и подача на английском (2-4 слова), напр. "
-            '"angry, shouting", "soft and warm", "excited", "sad", "sarcastic", '
-            '"neutral calm".\n'
-            "Верни только JSON-массив вида "
-            '[{"id":0,"translated_text":"...","speaker":"male","style":"angry, shouting"}] '
-            "строго для id из TARGET.\n\nCONTEXT:\n"
+            "3) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
+            "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
+            '(короткий смешок, вздох, придыхание, заминка). Например: "flustered and defensive, '
+            'a nervous little laugh, speaks fast and a bit high". Ремарки для парня и девушки '
+            "должны заметно отличаться по характеру.\n"
+            "Верни только JSON-массив "
+            '[{"id":0,"translated_text":"...","speaker":"male","style":"..."}] '
+            "строго для id из TARGET.\n\n"
+            + scene_block
+            + "CONTEXT:\n"
             + context_lines
             + "\n\nTARGET ids: "
             + json.dumps(target_ids)
@@ -225,7 +258,7 @@ class GeminiClient:
             {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generation_config": {
-                    "temperature": 0.35,
+                    "temperature": 0.6,
                     "response_mime_type": "application/json",
                 },
             },
@@ -239,7 +272,7 @@ class GeminiClient:
             if isinstance(item, dict) and item.get("translated_text") and "id" in item:
                 results[int(item["id"])] = item
 
-    def translate(self, segments: list[dict[str, Any]]) -> list[DubSegment]:
+    def translate(self, segments: list[dict[str, Any]], scene: str = "") -> list[DubSegment]:
         # Весь скрипт передаётся как контекст в каждый запрос — перевод получается
         # связным и согласованным, а не «вслепую» по кускам.
         context_lines = json.dumps(
@@ -257,7 +290,9 @@ class GeminiClient:
         results: dict[int, dict[str, Any]] = {}
         step = 40
         for offset in range(0, len(segments), step):
-            self._translate_batch(context_lines, segments[offset : offset + step], results)
+            self._translate_batch(
+                context_lines, scene, segments[offset : offset + step], results
+            )
 
         translated: list[DubSegment] = []
         for item in segments:
@@ -304,20 +339,28 @@ class GeminiClient:
         output_path: Path,
         duration: float,
         style_note: str = "",
+        scene: str = "",
     ) -> None:
-        directions = style_note.strip()
         prompt = (
-            "You are a professional Uzbek dubbing voice actor. Perform the line after MATN in "
-            "fluent, natural, conversational Uzbek. Pronounce EVERY word fully and clearly — "
-            "never drop, swallow or cut off words or endings, and read the whole line to the "
-            "very end. Convey the exact emotion and intonation given in DIRECTION — for example "
-            "anger, shouting, joy, sadness, fear, sarcasm or whispering — so the delivery "
-            "matches the original speaker's mood. Keep a natural, unhurried pace, aiming for "
-            f"about {duration:.1f} seconds through phrasing rather than speaking fast. Do not "
-            "read DIRECTION aloud and do not add any comments.\n"
+            "You are a top film dubbing voice actor performing a real character in a live scene "
+            "— NOT a text-to-speech reader. Perform the line after MATN in fluent, natural, "
+            "conversational Uzbek as a REAL PERSON would say it in this moment.\n"
+            "Absolute rules:\n"
+            "- Sound fully human and alive: rich emotion, expressive intonation, natural rhythm "
+            "with micro-pauses and small changes of pace. NEVER flat, monotone or robotic.\n"
+            "- Fully embody the emotion and attitude in DIRECTION (e.g. flustered, defensive, "
+            "cocky, teasing, nervous, excited). Let it clearly colour the voice.\n"
+            "- Where it fits the emotion, add subtle natural non-verbal touches — a short breath, "
+            "a small laugh or scoff, a brief hesitation — but keep ALL the Uzbek words intact.\n"
+            "- Pronounce every word fully and clearly to the very end; never cut words.\n"
+            "- Speak at a believable human pace (roughly "
+            f"{duration:.1f}s) through phrasing, not by rushing. Do not read SCENE/DIRECTION "
+            "aloud; output speech only.\n"
         )
-        if directions:
-            prompt += f"DIRECTION: {directions}\n"
+        if scene:
+            prompt += f"SCENE: {scene}\n"
+        if style_note.strip():
+            prompt += f"DIRECTION: {style_note.strip()}\n"
         prompt += f"MATN:\n{text}"
 
         payload = {
@@ -559,6 +602,7 @@ def _generate_segment(
     segment: DubSegment,
     budget: float,
     voice_map: dict[str, str],
+    scene: str,
     segments_dir: Path,
 ) -> tuple[Path, str, str]:
     raw = segments_dir / f"{segment.index:04d}-raw.wav"
@@ -566,7 +610,7 @@ def _generate_segment(
     fitted = segments_dir / f"{segment.index:04d}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
-    client.tts(spoken_text, voice, raw, budget, segment.style)
+    client.tts(spoken_text, voice, raw, budget, segment.style, scene)
     trim_lead_silence(raw, trimmed)
     shorten_attempts = 0
     while (
@@ -575,7 +619,7 @@ def _generate_segment(
         and shorten_attempts < 2
     ):
         spoken_text = client.shorten(spoken_text, budget)
-        client.tts(spoken_text, voice, raw, budget, segment.style)
+        client.tts(spoken_text, voice, raw, budget, segment.style, scene)
         trim_lead_silence(raw, trimmed)
         shorten_attempts += 1
     normalize_and_fit(trimmed, fitted, budget)
@@ -587,6 +631,7 @@ def render_timeline(
     segments: list[DubSegment],
     client: GeminiClient,
     voice_map: dict[str, str],
+    scene: str,
     work_dir: Path,
     progress: ProgressCallback,
 ) -> Path:
@@ -614,6 +659,7 @@ def render_timeline(
                 segment,
                 budgets[segment.index],
                 voice_map,
+                scene,
                 segments_dir,
             ): segment
             for segment in segments
@@ -719,10 +765,14 @@ def auto_dubbing_pipeline(
 
     client = GeminiClient()
     try:
-        progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
-        translated = client.translate(source_segments)
+        progress(32, "Анализируется сцена и характеры")
+        scene = client.analyze_scene(source_segments)
+        progress(40, f"Переводятся {len(source_segments)} реплик на узбекский")
+        translated = client.translate(source_segments, scene)
         progress(45, "Создаётся узбекская озвучка")
-        dubbed = render_timeline(duration, translated, client, voice_map, work_dir, progress)
+        dubbed = render_timeline(
+            duration, translated, client, voice_map, scene, work_dir, progress
+        )
     finally:
         client.close()
 
