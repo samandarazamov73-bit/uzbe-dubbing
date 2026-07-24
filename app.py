@@ -284,11 +284,13 @@ class GeminiClient:
         directions = [part.strip() for part in (global_style, style_note) if part.strip()]
         prompt = (
             "You are a professional Uzbek dubbing voice actor. Perform the line after MATN in "
-            "fluent, natural, conversational Uzbek. Convey the exact emotion and intonation "
-            "given in DIRECTION — for example anger, shouting, joy, sadness, fear, sarcasm or "
-            "whispering — so the delivery matches the original speaker's mood. Keep a natural, "
-            f"unhurried pace, aiming for about {duration:.1f} seconds through phrasing rather "
-            "than speaking fast. Do not read DIRECTION aloud and do not add any comments.\n"
+            "fluent, natural, conversational Uzbek. Pronounce EVERY word fully and clearly — "
+            "never drop, swallow or cut off words or endings, and read the whole line to the "
+            "very end. Convey the exact emotion and intonation given in DIRECTION — for example "
+            "anger, shouting, joy, sadness, fear, sarcasm or whispering — so the delivery "
+            "matches the original speaker's mood. Keep a natural, unhurried pace, aiming for "
+            f"about {duration:.1f} seconds through phrasing rather than speaking fast. Do not "
+            "read DIRECTION aloud and do not add any comments.\n"
         )
         if directions:
             prompt += "DIRECTION: " + " | ".join(directions) + "\n"
@@ -448,18 +450,24 @@ def atempo_filter(ratio: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
-MAX_SPEED_UP_RATIO = 1.15  # never speed up dubbed speech by more than ~15%
+MAX_SPEED_UP_RATIO = 1.35  # предельное ускорение, только если реплика не влезает в паузу
 
 
-def normalize_and_fit(source: Path, output: Path, target_seconds: float) -> None:
+def normalize_and_fit(source: Path, output: Path, budget_seconds: float) -> None:
+    """Подгоняет реплику под доступное время (до следующей реплики).
+
+    Ключевая идея: НЕ режем по длине исходной фразы, а используем паузу до
+    следующей реплики как запас. Ускоряем только если реплика реально не влезает,
+    и обрезаем лишь как крайнюю меру, чтобы не наезжать на следующую реплику.
+    """
     actual = media_duration(source)
     filters: list[str] = []
-    if actual > target_seconds * 1.04:
-        ratio = min(actual / max(target_seconds, 0.25), MAX_SPEED_UP_RATIO)
+    if actual > budget_seconds * 1.02:
+        ratio = min(actual / max(budget_seconds, 0.25), MAX_SPEED_UP_RATIO)
         filters.extend(["-filter:a", atempo_filter(ratio)])
     run_command(
         [
-            "ffmpeg", "-y", "-i", str(source), *filters, "-t", f"{target_seconds:.3f}",
+            "ffmpeg", "-y", "-i", str(source), *filters, "-t", f"{budget_seconds:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -483,6 +491,7 @@ TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
 def _generate_segment(
     client: GeminiClient,
     segment: DubSegment,
+    budget: float,
     voice_map: dict[str, str],
     global_style: str,
     segments_dir: Path,
@@ -491,17 +500,19 @@ def _generate_segment(
     fitted = segments_dir / f"{segment.index:04d}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
-    client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
+    client.tts(spoken_text, voice, raw, budget, segment.style, global_style)
+    # Сокращаем текст только если реплика намного длиннее доступной паузы —
+    # иначе слова обрезались бы. Порог по budget, а не по длине исходной фразы.
     shorten_attempts = 0
     while (
-        media_duration(raw) > segment.duration * 1.2
+        media_duration(raw) > budget * 1.35
         and len(spoken_text) > 12
         and shorten_attempts < 2
     ):
-        spoken_text = client.shorten(spoken_text, segment.duration)
-        client.tts(spoken_text, voice, raw, segment.duration, segment.style, global_style)
+        spoken_text = client.shorten(spoken_text, budget)
+        client.tts(spoken_text, voice, raw, budget, segment.style, global_style)
         shorten_attempts += 1
-    normalize_and_fit(raw, fitted, segment.duration)
+    normalize_and_fit(raw, fitted, budget)
     return fitted, spoken_text, voice
 
 
@@ -520,6 +531,14 @@ def render_timeline(
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
 
+    # Бюджет реплики — время до начала следующей реплики (включая паузу).
+    # Даёт запас, чтобы не резать слова и не ускорять речь без необходимости.
+    ordered = sorted(segments, key=lambda s: s.start)
+    budgets: dict[int, float] = {}
+    for position, segment in enumerate(ordered):
+        next_start = ordered[position + 1].start if position + 1 < len(ordered) else duration
+        budgets[segment.index] = max(0.5, next_start - segment.start - 0.03)
+
     # Генерируем реплики параллельно — это кратно быстрее строго последовательной озвучки.
     generated: dict[int, tuple[Path, str, str]] = {}
     total = len(segments)
@@ -528,7 +547,13 @@ def render_timeline(
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
         futures = {
             pool.submit(
-                _generate_segment, client, segment, voice_map, global_style, segments_dir
+                _generate_segment,
+                client,
+                segment,
+                budgets[segment.index],
+                voice_map,
+                global_style,
+                segments_dir,
             ): segment
             for segment in segments
         }
