@@ -4,7 +4,8 @@ Uzbek Video Dubbing — всё приложение в одном файле.
 Запуск (Python 3.11):
   1. Установите FFmpeg и убедитесь, что команды ffmpeg/ffprobe доступны.
   2. pip install fastapi "uvicorn[standard]" python-multipart httpx faster-whisper
-  3. Создайте НОВЫЙ Gemini API key и задайте его только через окружение:
+  3. Создайте НОВЫЙ Vertex AI Express Mode API key (формат "AQ....") и задайте
+     его только через окружение (никогда не пишите его в код):
        export GEMINI_API_KEY="ваш_новый_ключ"
   4. python app.py
   5. Откройте http://localhost:8000
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 import wave
 from array import array
@@ -118,17 +120,21 @@ class GeminiClient:
         self.http.close()
 
     def _post(self, model: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        last_error = "Неизвестная ошибка Gemini API"
+        # Vertex AI Express Mode: global endpoint, key as query param, snake_case fields.
+        url = (
+            f"https://aiplatform.googleapis.com/v1/publishers/google/models/"
+            f"{model}:generateContent?key={urllib.parse.quote(self.api_key, safe='')}"
+        )
+        last_error = "Неизвестная ошибка Vertex AI API"
         for attempt in range(3):
             try:
                 response = self.http.post(
                     url,
-                    headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                    headers={"Content-Type": "application/json"},
                     json=payload,
                 )
             except httpx.HTTPError as exc:
-                last_error = f"Gemini API недоступен: {exc}"
+                last_error = f"Vertex AI API недоступен: {exc}"
                 if attempt < 2:
                     time.sleep(2**attempt)
                     continue
@@ -141,7 +147,7 @@ class GeminiClient:
                 detail = response.json().get("error", {}).get("message", response.text)
             except ValueError:
                 detail = response.text
-            last_error = f"Gemini API: HTTP {response.status_code}: {detail}"
+            last_error = f"Vertex AI API: HTTP {response.status_code}: {detail}"
             if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2**attempt)
                 continue
@@ -156,7 +162,9 @@ class GeminiClient:
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts).strip()
         if not text:
-            reason = candidates[0].get("finishReason", "UNKNOWN")
+            reason = candidates[0].get("finishReason") or candidates[0].get(
+                "finish_reason", "UNKNOWN"
+            )
             raise RuntimeError(f"Gemini не вернул текст, причина: {reason}")
         return text
 
@@ -192,10 +200,10 @@ class GeminiClient:
             data = self._post(
                 self.text_model,
                 {
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generation_config": {
                         "temperature": 0.2,
-                        "responseMimeType": "application/json",
+                        "response_mime_type": "application/json",
                     },
                 },
             )
@@ -232,8 +240,8 @@ class GeminiClient:
         data = self._post(
             self.text_model,
             {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.2},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generation_config": {"temperature": 0.2},
             },
         )
         return self._response_text(data).strip().strip('"')
@@ -247,11 +255,11 @@ class GeminiClient:
         data = self._post(
             self.tts_model,
             {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseModalities": ["AUDIO"],
-                    "speechConfig": {
-                        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generation_config": {
+                    "response_modalities": ["AUDIO"],
+                    "speech_config": {
+                        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
                     },
                 },
             },
