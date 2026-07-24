@@ -12,7 +12,7 @@ Uzbek Video Dubbing — всё приложение в одном файле.
 
 Настройки окружения (необязательно):
   GEMINI_TEXT_MODEL=gemini-2.5-flash
-  GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts
+  GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
   WHISPER_MODEL=small
   WHISPER_DEVICE=cpu
   WHISPER_COMPUTE_TYPE=int8
@@ -106,7 +106,7 @@ class GeminiClient:
         self.api_key = api_key
         self.text_model = self._safe_model(os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"))
         self.tts_model = self._safe_model(
-            os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+            os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
         )
         self.http = httpx.Client(timeout=httpx.Timeout(180.0, connect=20.0))
 
