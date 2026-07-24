@@ -1004,6 +1004,7 @@ footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
     <div id="segments"></div>
   </section>
   <button class="primary" id="renderBtn" type="button">Сгенерировать озвучку</button>
+  <div id="renderProgress" hidden><div class="head"><div><span class="dot"></span><span id="renderStatus">Озвучка…</span></div><strong id="renderPercent">0%</strong></div><div class="track"><div class="bar" id="renderBar"></div></div></div>
   <button class="ghost" id="resetBtn" type="button">Загрузить другое видео</button>
   <p class="error" id="editorError" role="alert"></p>
 </section>
@@ -1018,6 +1019,7 @@ const form=$('#form'),video=$('#video'),drop=$('#drop'),fileName=$('#fileName'),
 const progress=$('#progress'),bar=$('#bar'),percent=$('#percent'),statusText=$('#status');
 const editor=$('#editor'),segmentsBox=$('#segments'),segCount=$('#segCount'),renderBtn=$('#renderBtn'),resetBtn=$('#resetBtn'),editorError=$('#editorError');
 const femaleVoice=$('#femaleVoice'),maleVoice=$('#maleVoice'),globalStyle=$('#globalStyle');
+const renderProgress=$('#renderProgress'),renderBar=$('#renderBar'),renderPercent=$('#renderPercent'),renderStatus=$('#renderStatus');
 const result=$('#result'),player=$('#player'),download=$('#download');
 let timer=null,jobId=null,segData=[];
 
@@ -1035,6 +1037,7 @@ function fail(box,m){box.textContent=m;box.classList.add('show')}
 function clearErr(box){box.textContent='';box.classList.remove('show')}
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
 function update(j){progress.hidden=false;const p=Math.max(0,Math.min(100,Number(j.progress)||0));bar.style.width=p+'%';percent.textContent=p+'%';statusText.textContent=j.message||'Обработка…'}
+function updateRender(j){renderProgress.hidden=false;const p=Math.max(0,Math.min(100,Number(j.progress)||0));renderBar.style.width=p+'%';renderPercent.textContent=p+'%';renderStatus.textContent=j.message||'Озвучка…'}
 async function parse(r){const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||`Ошибка HTTP ${r.status}`);return d}
 function fmtTime(t){const m=Math.floor(t/60),s=Math.floor(t%60);return `${m}:${String(s).padStart(2,'0')}`}
 
@@ -1076,13 +1079,13 @@ async function pollTranscribe(id){
 
 async function pollRender(id){
   try{
-    const j=await parse(await fetch(`/api/jobs/${id}`));update(j);
+    const j=await parse(await fetch(`/api/jobs/${id}`));updateRender(j);
     if(j.status==='completed'){
-      progress.hidden=true;renderBtn.disabled=false;renderBtn.textContent='Сгенерировать заново';
+      renderProgress.hidden=true;renderBtn.disabled=false;renderBtn.textContent='Сгенерировать заново';
       const url=j.result_url+'?t='+Date.now();player.src=url;download.href=url;
       result.hidden=false;result.scrollIntoView({behavior:'smooth'});return;
     }
-    if(j.status==='failed'){renderBtn.disabled=false;renderBtn.textContent='Попробовать снова';progress.hidden=true;fail(editorError,j.error||'Ошибка озвучки');return}
+    if(j.status==='failed'){renderBtn.disabled=false;renderBtn.textContent='Попробовать снова';renderProgress.hidden=true;fail(editorError,j.error||'Ошибка озвучки');return}
     timer=setTimeout(()=>pollRender(id),1500);
   }catch(e){renderBtn.disabled=false;fail(editorError,e.message)}
 }
@@ -1105,7 +1108,7 @@ renderBtn.onclick=async()=>{
   if(!segData.some(s=>s.translated_text.trim())){fail(editorError,'Заполните перевод хотя бы одной реплики');return}
   if(timer)clearTimeout(timer);
   renderBtn.disabled=true;renderBtn.textContent='Озвучивается…';
-  update({progress:5,message:'Озвучка ставится в очередь'});
+  updateRender({progress:5,message:'Озвучка ставится в очередь'});
   const body={
     female_voice:femaleVoice.value,male_voice:maleVoice.value,
     audio_mode:document.querySelector('input[name=audio_mode]:checked').value,
