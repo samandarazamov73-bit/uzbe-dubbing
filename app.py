@@ -72,8 +72,9 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.6  # предельное ускорение реплики (слова не обрезаем)
-MIN_SLOWDOWN_RATIO = 0.9  # предельное замедление (растяжение под окно оригинала)
+MAX_SPEED_UP_RATIO = 1.12  # предельное ускорение: выше — речь звучит как скороговорка
+MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
+OVERFLOW_TOLERANCE = 0.7   # насколько реплика может выйти за окно без ускорения
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 
@@ -450,9 +451,10 @@ class GeminiClient:
             "- Where it fits the emotion, add subtle natural non-verbal touches — a short breath, "
             "a small laugh or scoff, a brief hesitation — but keep ALL the Uzbek words intact.\n"
             "- Pronounce every word fully and clearly to the very end; never cut words.\n"
-            "- Speak at a believable human pace (roughly "
-            f"{duration:.1f}s) through phrasing, not by rushing. Do not read SCENE/DIRECTION "
-            "aloud; output speech only.\n"
+            "- Speak at a calm, relaxed, slightly slower-than-average conversational pace. "
+            "Take your time, leave natural little pauses between phrases. Do NOT rush or "
+            f"compress words (the line has about {duration:.1f}s available). Do not read "
+            "SCENE/DIRECTION aloud; output speech only.\n"
         )
         if scene:
             prompt += f"SCENE: {scene}\n"
@@ -841,19 +843,25 @@ def atempo_filter(ratio: float) -> str:
 
 
 def normalize_and_fit(
-    source: Path, output: Path, target_seconds: float, max_seconds: float
+    source: Path,
+    output: Path,
+    target_seconds: float,
+    max_seconds: float,
+    speech_speed: float = 1.0,
 ) -> None:
     """Подгоняет длину реплики: target — окно оригинала, max — предел до следующей."""
     actual = media_duration(source)
     # ВАЖНО: реплику НИКОГДА не обрезаем — ни одно слово не должно потеряться.
-    # Если она длиннее доступного окна, только ускоряем (в разумных пределах);
-    # если сильно короче окна оригинала, слегка растягиваем для попадания в губы.
+    # Ускоряем только если она сильно вылезает за окно, и очень умеренно, иначе
+    # речь звучит как скороговорка. Небольшое наложение допустимо.
     ratio = 1.0
-    if actual > max_seconds:
-        ratio = actual / max(max_seconds, 0.25)
+    if actual > max_seconds + OVERFLOW_TOLERANCE:
+        ratio = actual / max(max_seconds + OVERFLOW_TOLERANCE, 0.25)
     elif actual < target_seconds * 0.92:
         ratio = actual / max(target_seconds, 0.25)
     ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), MAX_SPEED_UP_RATIO)
+    # Пользовательская скорость: <1 — медленнее, >1 — быстрее.
+    ratio = min(max(ratio * speech_speed, 0.7), 1.3)
 
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
@@ -937,6 +945,7 @@ def _generate_segment(
     voice_map: dict[str, str],
     scene: str,
     segments_dir: Path,
+    speech_speed: float = 1.0,
 ) -> tuple[Path, str, str]:
     raw = segments_dir / f"{segment.index:04d}-raw.wav"
     trimmed = segments_dir / f"{segment.index:04d}-trim.wav"
@@ -946,7 +955,7 @@ def _generate_segment(
     # Текст НЕ сокращаем: перевод произносится целиком, слова не выбрасываются.
     client.tts(spoken_text, voice, raw, budget, segment.style, scene)
     trim_lead_silence(raw, trimmed)
-    normalize_and_fit(trimmed, fitted, segment.duration, budget)
+    normalize_and_fit(trimmed, fitted, segment.duration, budget, speech_speed)
     return fitted, spoken_text, voice
 
 
@@ -958,6 +967,7 @@ def render_timeline(
     scene: str,
     work_dir: Path,
     progress: ProgressCallback,
+    speech_speed: float = 1.0,
 ) -> Path:
     sample_rate = 24000
     # Запас в конце: реплики больше не обрезаются и могут выходить за окно.
@@ -1002,6 +1012,7 @@ def render_timeline(
                 voice_map,
                 scene,
                 segments_dir,
+                speech_speed,
             ): segment
             for segment in segments
         }
@@ -1028,7 +1039,13 @@ def render_timeline(
             time.sleep(1.0)
             try:
                 generated[segment.index] = _generate_segment(
-                    client, segment, budgets[segment.index], voice_map, scene, segments_dir
+                    client,
+                    segment,
+                    budgets[segment.index],
+                    voice_map,
+                    scene,
+                    segments_dir,
+                    speech_speed,
                 )
                 errors.pop(segment.index, None)
             except Exception as exc:
@@ -1191,6 +1208,7 @@ def auto_dubbing_pipeline(
     style_preset: str,
     original_volume: float,
     dub_volume: float,
+    speech_speed: float,
     progress: ProgressCallback,
 ) -> int:
     """Возвращает количество реплик, которые не удалось озвучить."""
@@ -1243,7 +1261,7 @@ def auto_dubbing_pipeline(
         client.polish(translated)
         progress(45, "Создаётся узбекская озвучка")
         dubbed = render_timeline(
-            duration, translated, client, voice_map, scene, work_dir, progress
+            duration, translated, client, voice_map, scene, work_dir, progress, speech_speed
         )
     finally:
         client.close()
@@ -1273,6 +1291,7 @@ def process_job(
     style_preset: str,
     original_volume: float,
     dub_volume: float,
+    speech_speed: float,
 ) -> None:
     output_path = input_path.parent / "uzbek-dubbed.mp4"
 
@@ -1289,6 +1308,7 @@ def process_job(
             style_preset,
             original_volume,
             dub_volume,
+            speech_speed,
             progress,
         )
         message = "Дубляж готов"
@@ -1369,6 +1389,7 @@ async def create_job(
     style_preset: str = Form("auto"),
     original_volume: float = Form(0.25),
     dub_volume: float = Form(1.0),
+    speech_speed: float = Form(0.95),
 ) -> dict[str, Any]:
     if not os.getenv("GEMINI_API_KEY", "").strip():
         raise HTTPException(status_code=503, detail="На сервере не задан GEMINI_API_KEY")
@@ -1429,6 +1450,7 @@ async def create_job(
         style_preset,
         original_volume,
         dub_volume,
+        min(max(speech_speed, 0.75), 1.25),
     )
     return public_job(job)
 
@@ -1563,6 +1585,8 @@ footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
     <div><label for="dubVol">Громкость дубляжа: <span id="dubVolVal">100%</span></label>
     <input type="range" id="dubVol" name="dub_volume" min="0.4" max="1.6" step="0.05" value="1"></div>
   </div>
+  <div style="margin-top:16px"><label for="speed">Скорость речи: <span id="speedVal">0.95x</span> <small style="display:inline;text-transform:none;letter-spacing:0">меньше — медленнее и спокойнее</small></label>
+  <input type="range" id="speed" name="speech_speed" min="0.75" max="1.15" step="0.05" value="0.95"></div>
 </div>
 </section>
 <button class="primary" id="submit" type="submit">Создать узбекский дубляж</button><p class="error" id="error" role="alert"></p></form>
@@ -1580,11 +1604,13 @@ const progress=$('#progress'),bar=$('#bar'),percent=$('#percent'),statusText=$('
 const advToggle=$('#advToggle'),advBox=$('#advBox'),femaleVoice=$('#femaleVoice'),maleVoice=$('#maleVoice');
 const result=$('#result'),player=$('#player'),download=$('#download'),srtLink=$('#srtLink');
 const origVol=$('#origVol'),dubVol=$('#dubVol'),origVolVal=$('#origVolVal'),dubVolVal=$('#dubVolVal');
+const speed=$('#speed'),speedVal=$('#speedVal');
 let timer=null;
 
 const pct=v=>Math.round(Number(v)*100)+'%';
 origVol.oninput=()=>origVolVal.textContent=pct(origVol.value);
 dubVol.oninput=()=>dubVolVal.textContent=pct(dubVol.value);
+speed.oninput=()=>speedVal.textContent=Number(speed.value).toFixed(2)+'x';
 
 VOICES.forEach(v=>{femaleVoice.add(new Option(v,v));maleVoice.add(new Option(v,v));});
 femaleVoice.value=DEF_FEMALE;maleVoice.value=DEF_MALE;
