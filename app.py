@@ -257,9 +257,12 @@ class GeminiClient:
             "означает то же самое, что и оригинал.\n"
             "   Пиши живым разговорным языком носителя, с эмоцией и интонацией персонажа, а не "
             "сухим подстрочником.\n"
-            "   ДЛИНА: старайся уложиться в max_chars символов (столько успевает произнести "
-            "человек за отрезок видео) — выбирай более короткие формулировки той же мысли. "
-            "Но НИКОГДА не жертвуй точностью смысла и грамматикой ради длины.\n"
+            "   ДЛИНА — ОЧЕНЬ ВАЖНО: узбекская фраза должна быть ПРИМЕРНО ТАКОЙ ЖЕ ДЛИНЫ, что и "
+            "оригинал. source_chars — длина оригинала в символах, max_chars — предел. Твой "
+            "перевод обязан быть близок к source_chars и НЕ длиннее max_chars. Если оригинал "
+            "короткий (например 10-15 символов), перевод тоже должен быть 10-15 символов — "
+            "коротко и по делу, без добавленных вводных слов и пояснений. Так дубляж совпадает "
+            "с речью на видео. Точность смысла при этом сохраняй.\n"
             '2) speaker — пол говорящего: "male" или "female".\n'
             "3) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
             "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
@@ -331,8 +334,10 @@ class GeminiClient:
                 {
                     "id": item["index"],
                     "duration_seconds": round(item["end"] - item["start"], 2),
-                    # Сколько символов реально успеть произнести за это время.
-                    "max_chars": max(14, int((item["end"] - item["start"]) * 16)),
+                    # Длина оригинала — главный ориентир: узбекская фраза должна
+                    # быть примерно такой же, тогда она попадает в тайминг.
+                    "source_chars": len(str(item["text"])),
+                    "max_chars": max(12, int(len(str(item["text"])) * 1.15)),
                     "text": item["text"],
                 }
                 for item in segments
@@ -536,6 +541,65 @@ class GeminiClient:
             for segment in batch:
                 better = fixed.get(segment.index)
                 if better:
+                    segment.translated_text = better
+        self.enforce_length(segments)
+
+    def enforce_length(self, segments: list[DubSegment]) -> None:
+        """Дожимает длину: перевод не должен быть заметно длиннее оригинала."""
+        too_long = [
+            segment
+            for segment in segments
+            if len(segment.translated_text) > max(14, int(len(segment.source_text) * 1.3))
+        ]
+        if not too_long:
+            return
+
+        for offset in range(0, len(too_long), 20):
+            batch = too_long[offset : offset + 20]
+            payload = [
+                {
+                    "id": segment.index,
+                    "source": segment.source_text,
+                    "uzbek": segment.translated_text,
+                    "max_chars": max(12, int(len(segment.source_text) * 1.15)),
+                }
+                for segment in batch
+            ]
+            prompt = (
+                "Сократи узбекские фразы так, чтобы каждая была примерно той же длины, что и "
+                "source, и НЕ длиннее max_chars символов. Убирай только лишние слова, вводные "
+                "конструкции и повторы — смысл, имена, числа и вопрос/отрицание сохрани "
+                "полностью. Это устная речь для дубляжа, пиши узбекской латиницей. "
+                'Верни только JSON-массив [{"id":0,"uzbek":"..."}].\n\nСТРОКИ:\n'
+                + json.dumps(payload, ensure_ascii=False)
+            )
+            try:
+                data = self._post(
+                    self.text_model,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generation_config": {
+                            "temperature": 0.2,
+                            "response_mime_type": "application/json",
+                        },
+                    },
+                )
+                result = self._json(self._response_text(data))
+            except RuntimeError:
+                continue
+            if isinstance(result, dict):
+                result = result.get("segments", result.get("lines", []))
+            if not isinstance(result, list):
+                continue
+            shortened = {
+                int(item["id"]): str(item["uzbek"]).strip()
+                for item in result
+                if isinstance(item, dict) and item.get("uzbek") and "id" in item
+            }
+            for segment in batch:
+                better = shortened.get(segment.index)
+                # Берём только если реально стало короче.
+                if better and len(better) < len(segment.translated_text):
                     segment.translated_text = better
 
     def tts(
@@ -1267,7 +1331,9 @@ def render_timeline(
     for segment in ordered:
         mark = "М" if segment.speaker == "male" else "Ж"
         print(
-            f"[dubbing]   {segment.start:6.2f}s {mark}  {segment.source_text[:48]}",
+            f"[dubbing]   {segment.start:6.2f}s {mark} "
+            f"[{len(segment.source_text):3d}->{len(segment.translated_text):3d}] "
+            f"{segment.translated_text[:44]}",
             flush=True,
         )
 
