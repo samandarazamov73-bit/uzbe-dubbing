@@ -74,7 +74,11 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
 MAX_SPEED_UP_RATIO = 1.12  # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
-OVERFLOW_TOLERANCE = 0.7   # насколько реплика может выйти за окно без ускорения
+OVERFLOW_TOLERANCE = 0.35  # насколько реплика может выйти за окно без ускорения
+SPEAKER_CHANGE_GAP = 0.18  # пауза перед ответом другого человека
+SAME_SPEAKER_GAP = 0.06    # пауза между фразами одного человека
+MAX_PLACEMENT_SHIFT = 1.5  # предел сдвига реплики, чтобы дубляж не уполз от видео
+SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 
@@ -971,7 +975,7 @@ def render_timeline(
 ) -> Path:
     sample_rate = 24000
     # Запас в конце: реплики больше не обрезаются и могут выходить за окно.
-    timeline = array("h", [0]) * (int(duration * sample_rate) + sample_rate * 6)
+    timeline = array("h", [0]) * (int(duration * sample_rate) + sample_rate * 12)
     segments_dir = work_dir / "segments"
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
@@ -1063,20 +1067,42 @@ def render_timeline(
         print(f"[dubbing] пропущено реплик: {len(errors)}\n{report}", flush=True)
     skipped_count = len(errors)
 
+    # Раскладка без наложений: реплика никогда не начинается, пока звучит
+    # предыдущая. Иначе мужской голос «перебивает» женский, говоря одновременно.
+    previous_end = 0.0
+    previous_speaker = ""
+    previous_source_end: float | None = None
     for segment in ordered:
         if segment.index not in generated:
             continue
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
-        start_sample = max(0, int(segment.start * sample_rate))
+        clip_seconds = len(clip) / sample_rate
+
+        # Наложение повторяет оригинал: если в видео человека перебивают, оставляем
+        # перебивание; если нет — дубляж тоже не должен звучать одновременно.
+        interrupts_in_source = (
+            previous_source_end is not None
+            and segment.start < previous_source_end - SOURCE_OVERLAP_EPS
+        )
+        gap = SPEAKER_CHANGE_GAP if segment.speaker != previous_speaker else SAME_SPEAKER_GAP
+        placement = segment.start
+        if not interrupts_in_source and placement < previous_end + gap:
+            # Сдвигаем позже, но не бесконечно — иначе дубляж уползёт от видео.
+            placement = min(previous_end + gap, segment.start + MAX_PLACEMENT_SHIFT)
+        previous_end = max(previous_end, placement + clip_seconds)
+        previous_speaker = segment.speaker
+        previous_source_end = segment.end
+
+        start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
             mixed = timeline[start_sample + index] + clip[index]
             timeline[start_sample + index] = max(-32768, min(32767, mixed))
         transcript.append(
             {
-                "start": round(segment.start, 3),
-                "end": round(segment.end, 3),
+                "start": round(placement, 3),
+                "end": round(placement + clip_seconds, 3),
                 "source": segment.source_text,
                 "uzbek": spoken_text,
                 "speaker": segment.speaker,
