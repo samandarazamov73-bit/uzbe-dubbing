@@ -79,6 +79,17 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
+# Подхватываем ключи из файла .env рядом с app.py, если он есть. Это самый
+# частый источник ошибки «не задан GEMINI_API_KEY»: ключ кладут в .env, а
+# приложение читало только переменные окружения процесса.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv()  # и .env из текущего каталога запуска
+except ImportError:
+    pass
+
 
 # -----------------------------------------------------------------------------
 # Конфигурация
@@ -224,7 +235,12 @@ class GeminiClient:
     def __init__(self) -> None:
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("На сервере не задан GEMINI_API_KEY")
+            raise RuntimeError(
+                "Не задан GEMINI_API_KEY. Задайте его перед запуском: "
+                "export GEMINI_API_KEY=\"ваш_ключ\" — или создайте файл .env рядом "
+                "с app.py со строкой GEMINI_API_KEY=ваш_ключ (без кавычек и пробелов "
+                "вокруг знака =)."
+            )
         self.api_key = api_key
         self.text_model = self._safe_model(os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"))
         self.tts_model = self._safe_model(
@@ -3520,7 +3536,11 @@ async def create_job(
     speech_speed: float = Form(0.95),
 ) -> dict[str, Any]:
     if not os.getenv("GEMINI_API_KEY", "").strip():
-        raise HTTPException(status_code=503, detail="На сервере не задан GEMINI_API_KEY")
+        raise HTTPException(
+            status_code=503,
+            detail="Не задан GEMINI_API_KEY. Задайте export GEMINI_API_KEY=... "
+            "или положите .env рядом с app.py и перезапустите сервер.",
+        )
     if source_language not in {"auto", "ru", "en", "uz"}:
         raise HTTPException(status_code=400, detail="Неподдерживаемый исходный язык")
     if female_voice not in VOICES or male_voice not in VOICES:
