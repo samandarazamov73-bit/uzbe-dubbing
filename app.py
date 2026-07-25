@@ -11,10 +11,15 @@ Uzbek Video Dubbing — всё приложение в одном файле (п
   5. Откройте http://localhost:8000
 
 Как работает (всё автоматически, править ничего не нужно):
-  Загружаете видео -> распознаётся речь -> Gemini переводит на узбекский,
-  сам определяет пол говорящего (голос переключается муж./жен.) и эмоцию каждой
-  реплики (злость, радость, крик и т.д.) -> голосом Gemini 3.1 создаётся озвучка
-  с нужной интонацией -> собирается готовое видео.
+  Загружаете видео -> распознаётся речь по СЛОВАМ -> слова выравниваются по
+  аудио -> диаризация размечает говорящих по всему файлу -> речь делится на
+  смысловые блоки одного говорящего, а те — на дыхательные группы по реальным
+  паузам -> Gemini переводит на узбекский под СЛОГОВОЙ бюджет -> голосом
+  Gemini 3.1 озвучивается каждая группа и ставится на своё начало слова ->
+  собирается готовое видео.
+
+Четыре независимых уровня (их смешивание было главной причиной рассинхрона):
+  слова ASR -> speaker turns -> translation units 4-12 с -> TTS-группы 1-4 с.
 
 Настройки окружения (необязательно):
   GEMINI_TEXT_MODEL=gemini-2.5-flash
@@ -22,11 +27,26 @@ Uzbek Video Dubbing — всё приложение в одном файле (п
   WHISPER_MODEL=medium   # точнее small; для максимума качества можно large-v3 (медленнее)
   WHISPER_DEVICE=cpu
   WHISPER_COMPUTE_TYPE=int8
+  FORCED_ALIGNMENT=auto  # off — не пытаться выравнивать слова через whisperx
+  DIARIZATION_BACKEND=auto  # auto|pyannote|gemini
+  PYANNOTE_MODEL=pyannote/speaker-diarization-community-1
+  HF_TOKEN=               # токен Hugging Face для pyannote
+  NUM_SPEAKERS=           # если число говорящих известно — задайте точно
+  MIN_SPEAKERS= / MAX_SPEAKERS=
   MAX_UPLOAD_MB=500
   MAX_VIDEO_MINUTES=20
   JOB_TTL_HOURS=24
-  TTS_CONCURRENCY=4      # сколько реплик озвучивать параллельно
+  TTS_CONCURRENCY=4      # сколько фраз озвучивать параллельно
   PORT=8000
+
+Точность липсинка растёт по мере работы: длительности реальных генераций
+складываются в data/tts_calibration.json и калибруют модель длительности для
+каждого голоса.
+
+Дополнительно (сильно повышает точность, ставится отдельно):
+  pip install whisperx           # forced alignment: точные границы слов
+  pip install pyannote.audio     # диаризация и разметка наложений
+Без них пайплайн работает на метках Whisper и диаризации через Gemini.
 
 API-ключ намеренно не хранится в этом файле и не отправляется в браузер.
 """
@@ -48,7 +68,7 @@ import uuid
 import wave
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -72,8 +92,13 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.3   # предельное ускорение: выше — речь звучит как скороговорка
-MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
+# Пост-обработка темпа — последнее средство, а не основной инструмент подгонки.
+# Сначала правим текст (слоговой бюджет), затем просим TTS говорить быстрее,
+# и только остаток добираем растяжением в узком, неслышимом диапазоне.
+MAX_SPEED_UP_RATIO = 1.15   # рабочий предел ускорения (выше уже слышно)
+MIN_SLOWDOWN_RATIO = 0.92   # рабочий предел замедления
+EMERGENCY_SPEED_UP = 1.25   # аварийный режим: только для коротких реплик (<2.5 с)
+REGENERATE_OVERFLOW = 1.15  # перегенерируем реплику, если вылезла больше чем на 15%
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
 ONSET_OFFSET = 0.0         # старт по реально найденному началу речи
@@ -107,18 +132,78 @@ _whisper_lock = threading.Lock()
 # -----------------------------------------------------------------------------
 
 @dataclass
+class Word:
+    """Уровень 1: слово с временными метками (ASR + forced alignment)."""
+
+    start: float
+    end: float
+    text: str
+    score: float = 1.0  # уверенность выравнивания (1.0 — метки прямо из ASR)
+    speaker: str = ""  # метка говорящего, назначается после диаризации
+
+
+@dataclass
+class SpeakerTurn:
+    """Уровень 2: непрерывный участок одного говорящего. Длина не ограничена."""
+
+    speaker: str
+    start: float
+    end: float
+    overlap: float = 0.0  # доля времени, занятая перекрытием с другим голосом
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass
+class DubChunk:
+    """Уровень 4: дыхательная группа — один запрос к TTS и одно место на таймлайне.
+
+    Каждая группа ставится на СВОЁ лексическое начало, поэтому реальные паузы
+    оригинала сохраняются сами собой, без вставки синтетической тишины.
+    """
+
+    start: float  # начало по словам ASR
+    end: float
+    source_text: str
+    text: str = ""  # узбекский текст этой группы
+    onset: float = 0.0  # уточнённое лексическое начало (куда ставим озвучку)
+    budget: float = 0.0  # сколько секунд реально доступно
+    generated: float = 0.0  # измеренная длительность TTS до подгонки
+    ratio: float = 1.0  # фактически применённое изменение темпа
+
+    @property
+    def duration(self) -> float:
+        return max(0.2, self.end - self.start)
+
+
+@dataclass
 class DubSegment:
+    """Уровень 3: translation unit — смысловой блок внутри одного speaker turn."""
+
     index: int
     start: float
     end: float
     source_text: str
-    translated_text: str
-    speaker: str = "female"  # "female" | "male"
+    translated_text: str = ""
+    speaker: str = "female"  # регистр голоса для TTS: "female" | "male"
+    speaker_label: str = ""  # кто говорит: S1, S2, ... (диаризация)
     style: str = ""  # авто-определённая эмоция/интонация реплики
+    chunks: list[DubChunk] = field(default_factory=list)
+    overlap: float = 0.0  # доля перекрытия с другим говорящим
+    short_variant: str = ""  # более короткий вариант перевода (на случай перелива)
 
     @property
     def duration(self) -> float:
         return max(0.25, self.end - self.start)
+
+    @property
+    def speech_budget(self) -> float:
+        """Время только под речь: сумма окон дыхательных групп без внутренних пауз."""
+        if self.chunks:
+            return sum(chunk.duration for chunk in self.chunks)
+        return self.duration
 
 
 class GeminiClient:
@@ -246,39 +331,41 @@ class GeminiClient:
         target: list[dict[str, Any]],
         results: dict[int, dict[str, Any]],
     ) -> None:
-        target_ids = [item["index"] for item in target]
         scene_block = f"SCENE BRIEF (для тона и характеров):\n{scene}\n\n" if scene else ""
         prompt = (
             "Ты режиссёр дубляжа и переводчик. Ниже SCENE BRIEF (разбор сцены) и CONTEXT — "
-            "весь скрипт по порядку. Переведи ТОЛЬКО реплики с id из TARGET, играя сцену.\n"
+            "весь скрипт по порядку. Переведи ТОЛЬКО реплики из TARGET, играя сцену.\n"
             "Для каждой целевой реплики верни поля:\n"
             "1) translated_text — ТОЧНЫЙ и ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ.\n"
             "   ГЛАВНОЕ — ТОЧНОСТЬ СМЫСЛА: переведи именно то, что человек сказал. Ничего не "
             "выдумывай, не добавляй и не выбрасывай смысловые части, сохраняй имена, числа, "
-            "вопрос остаётся вопросом, отрицание — отрицанием. Проверь, что узбекская фраза "
-            "означает то же самое, что и оригинал.\n"
+            "вопрос остаётся вопросом, отрицание — отрицанием.\n"
             "   Пиши живым разговорным языком носителя, с эмоцией и интонацией персонажа, а не "
             "сухим подстрочником.\n"
-            "   ДЛИНА — ОЧЕНЬ ВАЖНО: узбекская фраза должна быть ПРИМЕРНО ТАКОЙ ЖЕ ДЛИНЫ, что и "
-            "оригинал. source_chars — длина оригинала в символах, max_chars — предел. Твой "
-            "перевод обязан быть близок к source_chars и НЕ длиннее max_chars. Если оригинал "
-            "короткий (например 10-15 символов), перевод тоже должен быть 10-15 символов — "
-            "коротко и по делу, без добавленных вводных слов и пояснений. Так дубляж совпадает "
-            "с речью на видео. Точность смысла при этом сохраняй.\n"
-            '2) speaker — пол говорящего: "male" или "female".\n'
-            "3) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
+            "   ДЛИНА СЧИТАЕТСЯ В СЛОГАХ, НЕ В СИМВОЛАХ. target_syllables — сколько слогов "
+            "укладывается в окно оригинала, max_syllables — предел. Стремись к "
+            "target_syllables и не превышай max_syllables: считай слоги по гласным "
+            "(a, e, i, o, u, oʻ), учитывай, что цифры произносятся словами, а узбекские "
+            "окончания добавляют слоги. Короче — лучше, чем длиннее.\n"
+            "2) short_variant — тот же смысл, но на 20-30% КОРОЧЕ по слогам (убери вводные "
+            "слова, повторы и местоимения). Он пойдёт в дело, если основной вариант не влезет "
+            "в тайминг. Смысл, имена и числа обязаны сохраниться.\n"
+            "3) parts — ТОЛЬКО если у реплики в TARGET есть массив source_parts: верни ровно "
+            "столько же узбекских частей, в том же порядке и с тем же распределением смысла. "
+            "Части разделены реальными паузами актёра, их длительность сохраняется.\n"
+            "4) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
             "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
             '(короткий смешок, вздох, придыхание, заминка). Например: "flustered and defensive, '
-            'a nervous little laugh, speaks fast and a bit high". Ремарки для парня и девушки '
-            "должны заметно отличаться по характеру.\n"
+            'a nervous little laugh, speaks fast and a bit high". Разным персонажам — заметно '
+            "разные ремарки.\n"
             "Верни только JSON-массив "
-            '[{"id":0,"translated_text":"...","speaker":"male","style":"..."}] '
-            "строго для id из TARGET.\n\n"
+            '[{"id":0,"translated_text":"...","short_variant":"...","parts":["..."],'
+            '"style":"..."}] строго для id из TARGET.\n\n'
             + scene_block
             + "CONTEXT:\n"
             + context_lines
-            + "\n\nTARGET ids: "
-            + json.dumps(target_ids)
+            + "\n\nTARGET:\n"
+            + json.dumps(target, ensure_ascii=False)
         )
         data = self._post(
             self.text_model,
@@ -303,15 +390,14 @@ class GeminiClient:
     def _translate_single(self, item: dict[str, Any]) -> dict[str, Any] | None:
         """Простой резервный перевод одной реплики обычным текстом (без JSON).
 
-        Нужен, когда строгий формат с лимитом длины ломается на конкретной строке —
-        лучше перевести её проще, чем уронить весь дубляж.
+        Нужен, когда строгий формат ломается на конкретной строке — лучше
+        перевести её проще, чем уронить весь дубляж.
         """
-        seconds = max(0.4, item["end"] - item["start"])
-        limit = max(12, int(seconds * 14))
         prompt = (
             "Переведи эту реплику на естественный разговорный УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ. "
-            f"Уложись примерно в {limit} символов. Верни ТОЛЬКО перевод, без кавычек, "
-            "пояснений и форматирования:\n" + str(item["text"])
+            f"Уложись примерно в {item['target_syllables']} слогов (считай по гласным). "
+            "Верни ТОЛЬКО перевод, без кавычек, пояснений и форматирования:\n"
+            + str(item["source"])
         )
         try:
             data = self._post(
@@ -326,32 +412,47 @@ class GeminiClient:
             return None
         if not text:
             return None
-        return {"id": item["index"], "translated_text": text, "speaker": "female", "style": ""}
+        return {"id": item["id"], "translated_text": text, "style": ""}
 
-    def translate(self, segments: list[dict[str, Any]], scene: str = "") -> list[DubSegment]:
+    def translate(
+        self, units: list[DubSegment], voice_map: dict[str, str], scene: str = ""
+    ) -> None:
+        """Переводит translation units с бюджетом В СЛОГАХ и заполняет их на месте.
+
+        Единица перевода — смысловой блок одного говорящего (4-12 с), а не
+        обрубок в 3.2 с, поэтому синтаксис узбекской фразы больше не рвётся.
+        """
         # Весь скрипт передаётся как контекст в каждый запрос — перевод получается
         # связным и согласованным, а не «вслепую» по кускам.
         context_lines = json.dumps(
             [
-                {
-                    "id": item["index"],
-                    "duration_seconds": round(item["end"] - item["start"], 2),
-                    # Длина оригинала — главный ориентир: узбекская фраза должна
-                    # быть примерно такой же, тогда она попадает в тайминг.
-                    "source_chars": len(str(item["text"])),
-                    "max_chars": max(12, len(str(item["text"]))),
-                    "text": item["text"],
-                }
-                for item in segments
+                {"id": unit.index, "speaker": unit.speaker_label, "text": unit.source_text}
+                for unit in units
             ],
             ensure_ascii=False,
         )[:MAX_CONTEXT_CHARS]
+
+        payloads: dict[int, dict[str, Any]] = {}
+        for unit in units:
+            voice = voice_map.get(unit.speaker, voice_map["female"])
+            budget = unit.speech_budget
+            target = syllable_budget(budget, voice)
+            item: dict[str, Any] = {
+                "id": unit.index,
+                "source": unit.source_text,
+                "seconds": round(budget, 2),
+                "target_syllables": target,
+                "max_syllables": max(target + 2, int(target * 1.15)),
+            }
+            if len(unit.chunks) > 1:
+                item["source_parts"] = [chunk.source_text for chunk in unit.chunks]
+            payloads[unit.index] = item
 
         results: dict[int, dict[str, Any]] = {}
 
         def run(batch: list[dict[str, Any]], depth: int = 0) -> None:
             """Переводит партию; при сбое или пропусках делит её на половины."""
-            missing = [item for item in batch if item["index"] not in results]
+            missing = [item for item in batch if item["id"] not in results]
             if not missing:
                 return
             try:
@@ -359,7 +460,7 @@ class GeminiClient:
             except RuntimeError:
                 if len(missing) == 1 or depth >= 4:
                     raise
-            still_missing = [item for item in missing if item["index"] not in results]
+            still_missing = [item for item in missing if item["id"] not in results]
             if not still_missing:
                 return
             if len(still_missing) == 1 or depth >= 4:
@@ -367,49 +468,127 @@ class GeminiClient:
                 for item in still_missing:
                     fallback = self._translate_single(item)
                     if fallback:
-                        results[item["index"]] = fallback
+                        results[item["id"]] = fallback
                     else:
-                        raise RuntimeError(
-                            f"Gemini не перевёл реплику {item['index'] + 1}"
-                        )
+                        raise RuntimeError(f"Gemini не перевёл реплику {item['id'] + 1}")
                 return
             middle = len(still_missing) // 2
             run(still_missing[:middle], depth + 1)
             run(still_missing[middle:], depth + 1)
 
+        ordered = [payloads[unit.index] for unit in units]
         step = 20
-        for offset in range(0, len(segments), step):
-            run(segments[offset : offset + step])
+        for offset in range(0, len(ordered), step):
+            run(ordered[offset : offset + step])
 
-        translated: list[DubSegment] = []
-        for item in segments:
-            payload = results.get(item["index"])
+        for unit in units:
+            payload = results.get(unit.index)
             if not payload:
-                raise RuntimeError(f"Gemini пропустил реплику {item['index'] + 1}")
-            speaker = str(payload.get("speaker", "female")).strip().lower()
-            if speaker not in {"male", "female"}:
-                speaker = "female"
-            style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
-            translated.append(
-                DubSegment(
-                    index=item["index"],
-                    start=item["start"],
-                    end=item["end"],
-                    source_text=item["text"],
-                    translated_text=str(payload["translated_text"]).strip(),
-                    speaker=speaker,
-                    style=style,
+                raise RuntimeError(f"Gemini пропустил реплику {unit.index + 1}")
+            unit.translated_text = normalize_uzbek(str(payload["translated_text"]).strip())
+            unit.short_variant = normalize_uzbek(str(payload.get("short_variant", "")).strip())
+            unit.style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
+            parts = payload.get("parts")
+            texts: list[str] = []
+            if isinstance(parts, list) and len(parts) == len(unit.chunks):
+                texts = [normalize_uzbek(str(part).strip()) for part in parts]
+            if not all(texts):
+                texts = split_text_by_chunks(unit.translated_text, unit.chunks)
+            for chunk, text in zip(unit.chunks, texts):
+                chunk.text = text
+
+    def condense_to_budget(self, units: list[DubSegment], voice_map: dict[str, str]) -> int:
+        """Дожимает текст ДО озвучки: переписать короче лучше, чем потом ускорять.
+
+        Порядок из практики дубляжа: сначала адаптация текста, потом подача, и
+        только в конце лёгкая компрессия. Здесь — первый шаг: реплики, у которых
+        предсказанная длительность вылезает за окно, переписываются под слоговой
+        бюджет.
+        """
+        overflowing: list[DubSegment] = []
+        for unit in units:
+            voice = voice_map.get(unit.speaker, voice_map["female"])
+            if predict_unit_duration(unit, voice, safe=True) > (
+                unit.speech_budget * REGENERATE_OVERFLOW
+            ):
+                overflowing.append(unit)
+        if not overflowing:
+            return 0
+
+        fixed = 0
+        for offset in range(0, len(overflowing), 20):
+            batch = overflowing[offset : offset + 20]
+            payload = []
+            for unit in batch:
+                voice = voice_map.get(unit.speaker, voice_map["female"])
+                target = syllable_budget(unit.speech_budget, voice)
+                payload.append(
+                    {
+                        "id": unit.index,
+                        "source": unit.source_text,
+                        "uzbek": unit.translated_text,
+                        "target_syllables": target,
+                    }
                 )
+            prompt = (
+                "Сократи узбекские фразы так, чтобы каждая укладывалась в "
+                "target_syllables СЛОГОВ (считай по гласным a, e, i, o, u, oʻ; цифры "
+                "произносятся словами). Убирай только повторы, местоимения, вводные "
+                "конструкции и служебные слова; смысл, имена, числа, вопрос и отрицание "
+                "сохрани полностью. Второстепенное можно опустить, но обрывать слова и "
+                "фразу нельзя. Это устная речь для дубляжа, узбекская латиница. "
+                'Верни только JSON-массив [{"id":0,"uzbek":"..."}].\n\nСТРОКИ:\n'
+                + json.dumps(payload, ensure_ascii=False)
             )
-        return translated
+            try:
+                data = self._post(
+                    self.text_model,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generation_config": {
+                            "temperature": 0.2,
+                            "response_mime_type": "application/json",
+                        },
+                    },
+                )
+                result = self._json(self._response_text(data))
+            except RuntimeError:
+                continue
+            if isinstance(result, dict):
+                result = result.get("segments", result.get("lines", []))
+            if not isinstance(result, list):
+                continue
+            shortened = {
+                int(item["id"]): normalize_uzbek(str(item["uzbek"]).strip())
+                for item in result
+                if isinstance(item, dict) and item.get("uzbek") and "id" in item
+            }
+            for unit in batch:
+                voice = voice_map.get(unit.speaker, voice_map["female"])
+                candidate = shortened.get(unit.index)
+                if not candidate:
+                    continue
+                current = predict_unit_duration(unit, voice, safe=True)
+                improved = predict_speech_duration(candidate, voice, safe=True)
+                if improved < current:
+                    unit.translated_text = candidate
+                    for chunk, text in zip(
+                        unit.chunks, split_text_by_chunks(candidate, unit.chunks)
+                    ):
+                        chunk.text = text
+                    fixed += 1
+        return fixed
 
     def identify_speakers(
         self, audio: Path, segments: list[dict[str, Any]]
     ) -> tuple[dict[int, str], dict[str, str]]:
-        """Диаризация: кто говорит в каждой реплике и какого пола каждый говорящий.
+        """Резервная диаризация через Gemini: метки говорящих для черновых реплик.
 
-        Пол определяется ОДИН РАЗ на говорящего, а не на каждую реплику — поэтому
-        голос персонажа больше не «прыгает» с мужского на женский посреди диалога.
+        Это НЕ основной путь: LLM не даёт frame-level вероятностей, embeddings и
+        разметки наложений, поэтому на коротких репликах ошибается. Если доступен
+        pyannote, используется он. Результат здесь всегда проходит temporal
+        smoothing, а тембр голоса (низкий/высокий) считается отдельно по F0 —
+        мнение модели о поле используется только в спорной зоне.
         """
         try:
             raw = audio.read_bytes()
@@ -498,15 +677,30 @@ class GeminiClient:
 
         Ловит то, что часто портит первый проход: задвоенные слова, кальки с
         русского/английского, неестественные обороты, ошибки в латинице.
+        Вычитка идёт ПО ДЫХАТЕЛЬНЫМ ГРУППАМ с контекстом всей реплики, чтобы не
+        разрушить привязку частей к реальным паузам оригинала.
         """
-        for offset in range(0, len(segments), 30):
-            batch = segments[offset : offset + 30]
+        pairs = [
+            (segment, position, chunk)
+            for segment in segments
+            for position, chunk in enumerate(segment.chunks)
+            if chunk.text.strip()
+        ]
+        for offset in range(0, len(pairs), 30):
+            batch = pairs[offset : offset + 30]
             payload = [
-                {"id": s.index, "source": s.source_text, "uzbek": s.translated_text}
-                for s in batch
+                {
+                    "id": number,
+                    "context": segment.source_text,
+                    "source": chunk.source_text,
+                    "uzbek": chunk.text,
+                }
+                for number, (segment, _, chunk) in enumerate(batch, start=offset)
             ]
             prompt = (
-                "Ты редактор-носитель узбекского языка, вычитываешь текст дубляжа. Для каждой "
+                "Ты редактор-носитель узбекского языка, вычитываешь текст дубляжа. context — "
+                "вся реплика целиком (для понимания), source — именно та часть, которую нужно "
+                "проверить. Для каждой "
                 "строки СНАЧАЛА проверь главное: точно ли uzbek передаёт смысл source — не "
                 "потерян ли смысловой кусок, не искажён ли смысл, сохранены ли имена, числа, "
                 "вопрос/отрицание. Если смысл неверный, перепиши строку правильно. Затем "
@@ -540,70 +734,13 @@ class GeminiClient:
                 for item in result
                 if isinstance(item, dict) and item.get("uzbek") and "id" in item
             }
-            for segment in batch:
-                better = fixed.get(segment.index)
+            for number, (segment, _, chunk) in enumerate(batch, start=offset):
+                better = fixed.get(number)
                 if better:
-                    segment.translated_text = better
-        self.enforce_length(segments)
-
-    def enforce_length(self, segments: list[DubSegment]) -> None:
-        """Дожимает длину: перевод не должен быть заметно длиннее оригинала."""
-        # Строго: перевод не должен быть длиннее оригинала более чем на 5%.
-        too_long = [
-            segment
-            for segment in segments
-            if len(segment.translated_text) > max(14, int(len(segment.source_text) * 1.05))
-        ]
-        if not too_long:
-            return
-
-        for offset in range(0, len(too_long), 20):
-            batch = too_long[offset : offset + 20]
-            payload = [
-                {
-                    "id": segment.index,
-                    "source": segment.source_text,
-                    "uzbek": segment.translated_text,
-                    "max_chars": max(12, len(segment.source_text)),
-                }
-                for segment in batch
-            ]
-            prompt = (
-                "Сократи узбекские фразы так, чтобы каждая была примерно той же длины, что и "
-                "source, и НЕ длиннее max_chars символов. Убирай только лишние слова, вводные "
-                "конструкции и повторы — смысл, имена, числа и вопрос/отрицание сохрани "
-                "полностью. Это устная речь для дубляжа, пиши узбекской латиницей. "
-                'Верни только JSON-массив [{"id":0,"uzbek":"..."}].\n\nСТРОКИ:\n'
-                + json.dumps(payload, ensure_ascii=False)
-            )
-            try:
-                data = self._post(
-                    self.text_model,
-                    {
-                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                        "generation_config": {
-                            "temperature": 0.2,
-                            "response_mime_type": "application/json",
-                        },
-                    },
-                )
-                result = self._json(self._response_text(data))
-            except RuntimeError:
-                continue
-            if isinstance(result, dict):
-                result = result.get("segments", result.get("lines", []))
-            if not isinstance(result, list):
-                continue
-            shortened = {
-                int(item["id"]): str(item["uzbek"]).strip()
-                for item in result
-                if isinstance(item, dict) and item.get("uzbek") and "id" in item
-            }
-            for segment in batch:
-                better = shortened.get(segment.index)
-                # Берём только если реально стало короче.
-                if better and len(better) < len(segment.translated_text):
-                    segment.translated_text = better
+                    chunk.text = normalize_uzbek(better)
+                    segment.translated_text = _clean_words(
+                        " ".join(part.text for part in segment.chunks if part.text)
+                    )
 
     def tts(
         self,
@@ -614,6 +751,8 @@ class GeminiClient:
         style_note: str = "",
         scene: str = "",
         speaker: str = "",
+        context: str = "",
+        pace: str = "normal",
     ) -> None:
         # Пол задаём и в конфиге, и словами в промпте: одной настройки модели
         # оказалось недостаточно — она озвучивала все реплики одним голосом.
@@ -641,15 +780,34 @@ class GeminiClient:
             "- Where it fits the emotion, add subtle natural non-verbal touches — a short breath, "
             "a small laugh or scoff, a brief hesitation — but keep ALL the Uzbek words intact.\n"
             "- Pronounce every word fully and clearly to the very end; never cut words.\n"
-            "- Speak at a calm, relaxed, slightly slower-than-average conversational pace. "
-            "Take your time, leave natural little pauses between phrases. Do NOT rush or "
-            f"compress words (the line has about {duration:.1f}s available). Do not read "
-            "SCENE/DIRECTION aloud; output speech only.\n"
+            "- Do not add any pause before the first word and do not trail off with silence "
+            "at the end: the timing of pauses is set by the film, not by you.\n"
+            "- Do not read SCENE/DIRECTION/FULL LINE aloud; output speech only.\n"
         )
+        if pace == "faster":
+            # Просьба к подаче — второй шаг после правки текста и ДО любого DSP.
+            prompt += (
+                "- PACE: speak noticeably faster and more energetic than usual, keep it "
+                f"natural, no dragging: the line must fit about {duration:.1f}s.\n"
+            )
+        else:
+            prompt += (
+                "- Speak at a calm, relaxed, slightly slower-than-average conversational pace. "
+                "Take your time, leave natural little pauses between phrases. Do NOT rush or "
+                f"compress words (the line has about {duration:.1f}s available).\n"
+            )
         if scene:
             prompt += f"SCENE: {scene}\n"
         if style_note.strip():
             prompt += f"DIRECTION: {style_note.strip()}\n"
+        if context.strip() and context.strip() != text.strip():
+            # Контекст всей реплики держит интонацию: дыхательная группа не
+            # звучит как отдельная оборванная фраза.
+            prompt += (
+                f"FULL LINE (context only, do NOT speak it): {context.strip()}\n"
+                "Speak ONLY the part after MATN, with intonation that fits its place in "
+                "the full line.\n"
+            )
         prompt += f"MATN:\n{text}"
 
         # Только snake_case: дублирование camelCase API отклоняет (oneof-конфликт).
@@ -764,10 +922,36 @@ def has_audio(path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def audio_channels(path: Path) -> int:
+    result = run_command(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=channels", "-of", "csv=p=0", str(path),
+        ],
+        timeout=60,
+    )
+    try:
+        return int(result.stdout.strip().rstrip(","))
+    except ValueError:
+        return 0
+
+
 def extract_audio(video: Path, output: Path) -> None:
+    """Моно 16 кГц для распознавания и диаризации.
+
+    У многоканального источника (5.1) диалог живёт в центральном канале: берём
+    его напрямую, иначе музыка и эффекты из остальных каналов ухудшают и ASR, и
+    диаризацию. Простой downmix оставляем только для моно/стерео.
+    """
+    channels = audio_channels(video)
+    if channels >= 6:
+        filters = ["-af", "pan=mono|c0=FC"]
+        print(f"[dubbing] источник {channels}-канальный: беру центральный канал", flush=True)
+    else:
+        filters = ["-ac", "1"]
     run_command(
         [
-            "ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
+            "ffmpeg", "-y", "-i", str(video), "-vn", *filters, "-ar", "16000",
             "-c:a", "pcm_s16le", str(output),
         ]
     )
@@ -792,16 +976,47 @@ def whisper_model():
 
 
 SENTENCE_END = (".", "!", "?", "…")
-CHUNK_MAX_SECONDS = 3.2   # короткие фразы: точнее синхрон и не смешиваются говорящие
-CHUNK_GAP_SECONDS = 0.32  # пауза, по которой начинаем новую фразу
+
+# -----------------------------------------------------------------------------
+# Четыре РАЗНЫХ уровня разбиения (раньше это была одна «фраза» на всё сразу).
+#
+#   1) слова ASR                  — атомы времени, приходят из word timestamps;
+#   2) speaker turn               — участок одного говорящего (диаризация),
+#                                   БЕЗ искусственного лимита длины;
+#   3) translation unit           — предложение/смысловой блок ~4-12 с,
+#                                   всегда внутри ОДНОГО speaker turn;
+#   4) TTS chunk (дыхательная группа) — то, что реально уходит в TTS одним
+#                                   куском: 1-4 с между реальными паузами.
+#
+# Смешивание этих уровней и было главным дефектом: лимит 3.2 с рвал и
+# акустический контекст говорящего, и синтаксис перевода.
+# -----------------------------------------------------------------------------
+UNIT_TARGET_SECONDS = 8.0    # к такой длине стремимся для translation unit
+UNIT_MAX_SECONDS = 12.0      # жёсткий предел одного смыслового блока
+UNIT_FLUSH_SECONDS = 3.5     # после конца предложения закрываем unit от этой длины
+UNIT_SPLIT_GAP = 0.6         # пауза, по которой обязательно начинаем новый unit
+TURN_MERGE_GAP = 0.7         # соседние реплики одного говорящего сливаем в turn
+SHORT_TURN_SECONDS = 1.2     # такие «одиночные» метки считаем ненадёжными
+# Пауза >= 250 мс синхронизируется программно (её слышно и часто под жест);
+# всё, что короче, остаётся на совести пунктуации и самого TTS.
+CHUNK_PAUSE_MIN = 0.25
+CHUNK_MAX_SECONDS = 8.0      # предел дыхательной группы для одного TTS-запроса
+UTTERANCE_GAP = 0.5          # черновая нарезка для диаризационного промпта
+UTTERANCE_MAX_SECONDS = 6.0
+ONSET_SEARCH_BACK = 0.20     # насколько раньше первого слова ищем его атаку
+ONSET_SEARCH_FORWARD = 0.30  # и насколько позже
+ONSET_LEAD = 0.03            # запас перед найденной атакой согласного
 
 
 PITCH_RATE = 8000       # частота для анализа питча (достаточно для F0)
 PITCH_MIN_HZ = 70.0
 PITCH_MAX_HZ = 400.0
-PITCH_SPLIT_HZ = 165.0        # граница мужской/женский в спорных случаях
-MALE_CONFIDENT_HZ = 155.0     # ниже — точно мужской голос
-FEMALE_CONFIDENT_HZ = 190.0   # выше — точно женский голос
+PITCH_SPLIT_HZ = 170.0        # граница низкий/высокий регистр в спорных случаях
+MALE_CONFIDENT_HZ = 155.0     # ниже — уверенно низкий регистр
+FEMALE_CONFIDENT_HZ = 185.0   # выше — уверенно высокий регистр
+PITCH_MIN_VOICED = 1.0        # минимум озвученного материала на говорящего, с
+ANCHOR_MIN_SECONDS = 2.5      # «эталонный» участок говорящего: не короче этого
+ANCHOR_MAX_OVERLAP = 0.10     # и почти без наложения чужого голоса
 
 
 def make_pitch_audio(video: Path, output: Path) -> None:
@@ -819,8 +1034,12 @@ def make_pitch_audio(video: Path, output: Path) -> None:
     )
 
 
-def _frame_pitch(signal: list[float], sample_rate: int) -> float:
-    """Питч одного кадра через нормализованную автокорреляцию с коррекцией октавы."""
+def _frame_pitch(signal: list[float], sample_rate: int, min_corr: float = 0.60) -> float:
+    """Питч одного кадра через нормализованную автокорреляцию с коррекцией октавы.
+
+    Кадр принимается только при достаточно высоком пике автокорреляции: шум и
+    шипящие не должны попадать в статистику F0.
+    """
     count = len(signal)
     mean = sum(signal) / count
     centred = [value - mean for value in signal]
@@ -844,7 +1063,7 @@ def _frame_pitch(signal: list[float], sample_rate: int) -> float:
         if norm > best_score:
             best_score, best_lag = norm, lag
 
-    if not best_lag or best_score < 0.3:
+    if not best_lag or best_score < min_corr:
         return 0.0
 
     # Коррекция октавы: автокорреляция любит удвоенный период (вдвое ниже тон).
@@ -854,67 +1073,50 @@ def _frame_pitch(signal: list[float], sample_rate: int) -> float:
     return sample_rate / best_lag
 
 
-def _segment_pitch(samples: array, sample_rate: int) -> float:
-    """Медианный питч по многим кадрам — устойчив к шуму и выбросам."""
-    frame = 512                      # 64 мс при 8 кГц
-    hop = 256
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _segment_pitch_values(samples: array, sample_rate: int, limit: int = 40) -> list[float]:
+    """Все надёжные F0-кадры участка. Кадр 40 мс, шаг 10 мс, порог корреляции 0.6.
+
+    Возвращаем именно кадры, а не одно число: решение о регистре голоса
+    принимается по агрегату ВСЕХ реплик говорящего, а не по одной фразе.
+    """
+    frame = max(64, int(sample_rate * 0.04))  # 40 мс
+    hop = max(16, int(sample_rate * 0.01))  # 10 мс
     if len(samples) < frame:
-        return 0.0
+        return []
 
-    # Берём только достаточно громкие кадры (там речь, а не пауза).
-    frames: list[tuple[float, int]] = []
+    energies: list[tuple[float, int]] = []
     for start in range(0, len(samples) - frame + 1, hop):
-        chunk = samples[start : start + frame]
-        energy = sum(abs(value) for value in chunk) / frame
-        frames.append((energy, start))
-    if not frames:
-        return 0.0
-    loudest = max(energy for energy, _ in frames)
+        window = samples[start : start + frame]
+        energies.append((sum(abs(value) for value in window) / frame, start))
+    if not energies:
+        return []
+    loudest = max(energy for energy, _ in energies)
     if loudest < 50:
-        return 0.0
+        return []
 
-    candidates = [start for energy, start in frames if energy >= loudest * 0.35]
-    if len(candidates) > 24:  # ограничиваем работу, распределяя кадры по реплике
-        step = len(candidates) / 24
-        candidates = [candidates[int(i * step)] for i in range(24)]
+    candidates = [start for energy, start in energies if energy >= loudest * 0.35]
+    if len(candidates) > limit:  # ограничиваем работу, распределяя кадры по участку
+        step = len(candidates) / limit
+        candidates = [candidates[int(i * step)] for i in range(limit)]
 
     values: list[float] = []
-    for start in candidates:
-        signal = [float(value) for value in samples[start : start + frame]]
-        pitch = _frame_pitch(signal, sample_rate)
-        if PITCH_MIN_HZ <= pitch <= PITCH_MAX_HZ:
-            values.append(pitch)
-
-    if len(values) < 3:
-        return 0.0
-    values.sort()
-    return values[len(values) // 2]
-
-
-def _split_two_speakers(pitches: list[float]) -> float | None:
-    """Ищет границу между двумя голосами (1D k-means). None — говорящий один."""
-    if len(pitches) < 4:
-        return None
-    low, high = min(pitches), max(pitches)
-    if high - low < 45.0:
-        return None
-
-    centre_low, centre_high = low, high
-    for _ in range(25):
-        group_low = [p for p in pitches if abs(p - centre_low) <= abs(p - centre_high)]
-        group_high = [p for p in pitches if abs(p - centre_low) > abs(p - centre_high)]
-        if not group_low or not group_high:
-            return None
-        new_low = sum(group_low) / len(group_low)
-        new_high = sum(group_high) / len(group_high)
-        if abs(new_low - centre_low) < 0.5 and abs(new_high - centre_high) < 0.5:
-            centre_low, centre_high = new_low, new_high
+    for min_corr in (0.60, 0.40):  # второй проход мягче — если материал шумный
+        values = []
+        for start in candidates:
+            signal = [float(value) for value in samples[start : start + frame]]
+            pitch = _frame_pitch(signal, sample_rate, min_corr)
+            if PITCH_MIN_HZ <= pitch <= PITCH_MAX_HZ:
+                values.append(pitch)
+        if len(values) >= 8:
             break
-        centre_low, centre_high = new_low, new_high
-
-    if centre_high - centre_low < 40.0:
-        return None  # разброс слишком мал — это один голос
-    return (centre_low + centre_high) / 2
+    return values
 
 
 def _load_mono(audio: Path) -> tuple[array, int]:
@@ -930,179 +1132,462 @@ def _load_mono(audio: Path) -> tuple[array, int]:
     return samples, rate
 
 
-def speaker_pitches(
-    audio: Path, segments: list[dict[str, Any]], turns: dict[int, str]
-) -> dict[str, float]:
-    """Медианный питч голоса каждого говорящего — объективная проверка пола."""
+def speaker_pitches(audio: Path, diarization: Diarization) -> dict[str, float]:
+    """Медианный F0 КАЖДОГО ГОВОРЯЩЕГО, агрегированный по всем его репликам.
+
+    F0 не идентифицирует человека (высокий мужской и низкий женский голос
+    пересекаются), поэтому питч больше не участвует в определении «кто говорит».
+    Он нужен ровно для одного — выбрать низкий или высокий TTS-тембр. Считаем
+    его по «эталонным» участкам: длинным, без наложения чужого голоса.
+    """
     try:
         samples, rate = _load_mono(audio)
     except (wave.Error, OSError, RuntimeError):
         return {}
 
-    per_speaker: dict[str, list[float]] = {}
-    for item in segments:
-        label = turns.get(item["index"])
-        if not label:
-            continue
-        start = max(0, int(item["start"] * rate))
-        end = min(len(samples), int(item["end"] * rate))
-        if end - start < rate // 5:
-            continue
-        pitch = _segment_pitch(samples[start:end], rate)
-        if pitch > 0:
-            per_speaker.setdefault(label, []).append(pitch)
+    anchors: dict[str, list[SpeakerTurn]] = {}
+    for turn in diarization.turns:
+        anchors.setdefault(turn.speaker, []).append(turn)
 
     medians: dict[str, float] = {}
-    for label, values in per_speaker.items():
-        if values:
-            values.sort()
-            medians[label] = values[len(values) // 2]
+    hop_seconds = 0.01
+    for label, turns in anchors.items():
+        clean = [
+            turn
+            for turn in turns
+            if turn.duration >= ANCHOR_MIN_SECONDS and turn.overlap <= ANCHOR_MAX_OVERLAP
+        ]
+        # Если длинных чистых участков нет — берём самые длинные из имеющихся.
+        chosen = clean or sorted(turns, key=lambda item: item.duration, reverse=True)[:6]
+        values: list[float] = []
+        for turn in sorted(chosen, key=lambda item: item.duration, reverse=True)[:8]:
+            start = max(0, int(turn.start * rate))
+            end = min(len(samples), int(turn.end * rate))
+            if end - start < rate // 4:
+                continue
+            values.extend(_segment_pitch_values(samples[start:end], rate, limit=60))
+        # Решение только при достаточном объёме озвученного материала.
+        if len(values) * hop_seconds >= PITCH_MIN_VOICED:
+            medians[label] = _median(values)
     return medians
 
 
-def verify_genders_by_pitch(
-    speaker_genders: dict[str, str], medians: dict[str, float]
+def voice_registers(
+    diarization: Diarization, medians: dict[str, float]
 ) -> dict[str, str]:
-    """Определяет пол говорящих ПО ВЫСОТЕ ГОЛОСА — это объективно и надёжно.
+    """Выбирает TTS-тембр (низкий/высокий) на говорящего, а не на реплику.
 
-    Мнение модели используется только для тех, у кого питч измерить не удалось.
+    Это выбор голоса для озвучки, а не «определение пола человека»: в спорной
+    зоне 155-185 Гц опираемся на мнение модели, слышавшей тембр, и только затем
+    на абсолютный порог. Решение одно на весь фильм, поэтому голос персонажа
+    не «прыгает» посреди диалога и короткая реплика не может его сменить.
     """
-    verified = dict(speaker_genders)
-    usable = {label: pitch for label, pitch in medians.items() if pitch > 0}
-
-    # ВАЖНО: не делим говорящих «один мужчина + одна женщина» насильно.
-    # Если в видео два мужчины, оба должны остаться мужчинами.
-    ambiguous: list[str] = []
-    for label, pitch in usable.items():
-        if pitch < MALE_CONFIDENT_HZ:
-            verified[label] = "male"        # уверенно мужской диапазон
+    registers: dict[str, str] = {}
+    uncertain: list[str] = []
+    for label in diarization.speakers:
+        pitch = medians.get(label, 0.0)
+        if pitch <= 0:
+            uncertain.append(label)
+        elif pitch < MALE_CONFIDENT_HZ:
+            registers[label] = "male"
         elif pitch > FEMALE_CONFIDENT_HZ:
-            verified[label] = "female"      # уверенно женский диапазон
+            registers[label] = "female"
         else:
-            ambiguous.append(label)         # спорная зона — решаем отдельно
+            uncertain.append(label)
 
-    for label in ambiguous:
-        opinion = speaker_genders.get(label)
+    for label in uncertain:
+        opinion = diarization.genders.get(label)
         if opinion in {"male", "female"}:
-            verified[label] = opinion       # доверяем модели: она слышала тембр
+            registers[label] = opinion
             continue
-        # Мнения модели нет: сравниваем с уверенно определёнными голосами.
-        confident_male = [
-            usable[other]
-            for other, gender in verified.items()
-            if gender == "male" and other in usable and other not in ambiguous
-        ]
-        if confident_male and usable[label] - max(confident_male) > 40.0:
-            verified[label] = "female"
-        else:
-            verified[label] = "male" if usable[label] < PITCH_SPLIT_HZ else "female"
-    return verified
+        pitch = medians.get(label, 0.0)
+        if pitch > 0:
+            registers[label] = "male" if pitch < PITCH_SPLIT_HZ else "female"
+            continue
+        # Ничего не известно: не выдумываем — берём регистр самого «похожего»
+        # соседа, а если и его нет, ставим низкий (он реже звучит комично).
+        registers[label] = next(iter(registers.values()), "male")
+    return registers
 
 
-def detect_speech_onsets(
-    audio: Path, segments: list[dict[str, Any]]
-) -> dict[int, float]:
-    """Находит РЕАЛЬНОЕ начало речи в оригинале по энергии сигнала.
+def _frame_levels(
+    samples: array, rate: int, start: float, end: float
+) -> list[tuple[float, float]]:
+    """Уровень сигнала по кадрам 10 мс: [(время, амплитуда), ...]."""
+    frame = max(1, rate // 100)
+    first = max(0, int(start * rate))
+    last = min(len(samples), int(end * rate))
+    levels: list[tuple[float, float]] = []
+    position = first
+    while position + frame <= last:
+        window = samples[position : position + frame]
+        levels.append((position / rate, float(max(abs(value) for value in window))))
+        position += frame
+    return levels
 
-    Распознавание часто помечает начало фразы раньше, чем человек действительно
-    заговорил, из-за чего дубляж звучал с опережением.
+
+def refine_lexical_onset(
+    samples: array, rate: int, word_start: float, lower: float, upper: float
+) -> float:
+    """Уточняет начало ПЕРВОГО СЛОВА, а не «первого громкого звука».
+
+    Ключевое отличие от прежней логики: поиск ограничен окрестностью слова,
+    полученного из ASR/forced alignment. Поэтому вздох, смешок или кашель за
+    секунду до речи в принципе не могут стать началом реплики — они попросту
+    вне окна поиска. Внутри окна ищем атаку: устойчивое превышение локального
+    шумового порога, и отступаем на 30 мс назад, чтобы не срезать согласный.
     """
+    search_from = max(lower, word_start - ONSET_SEARCH_BACK)
+    search_to = min(upper, word_start + ONSET_SEARCH_FORWARD)
+    if search_to - search_from < 0.03:
+        return word_start
+
+    floor_levels = [
+        level
+        for _, level in _frame_levels(
+            samples, rate, max(0.0, search_from - 1.0), search_from
+        )
+    ]
+    floor_levels.sort()
+    noise = floor_levels[int(len(floor_levels) * 0.2)] if floor_levels else 0.0
+
+    body = _frame_levels(samples, rate, word_start, min(upper, word_start + 0.8))
+    peak = max((level for _, level in body), default=0.0)
+    if peak < 150:
+        return word_start
+    threshold = max(noise * 3.5, peak * 0.12, 120.0)
+
+    levels = _frame_levels(samples, rate, search_from, search_to)
+    for position, (moment, level) in enumerate(levels):
+        if level < threshold:
+            continue
+        window = [value for _, value in levels[position : position + 8]]
+        if len(window) < 4:
+            break
+        if sum(1 for value in window if value >= threshold) >= max(3, int(len(window) * 0.6)):
+            return max(lower, min(moment - ONSET_LEAD, word_start + ONSET_SEARCH_FORWARD))
+    return word_start
+
+
+def refine_onsets(audio: Path, units: list[DubSegment], diarization: Diarization) -> int:
+    """Ставит каждой дыхательной группе её лексическое начало (dub_start)."""
     try:
         samples, rate = _load_mono(audio)
     except (wave.Error, OSError, RuntimeError):
-        return {}
+        return 0
 
-    onsets: dict[int, float] = {}
-    frame = max(1, rate // 100)  # кадр 10 мс
-    for item in segments:
-        search_from = max(0, int((item["start"] - 0.15) * rate))
-        # Ищем дальше вперёд: распознавание могло принять за начало фразы
-        # вздох или смешок за секунду до настоящей речи.
-        search_to = min(
-            len(samples),
-            int((item["start"] + 1.5) * rate),
-            max(0, int((item["end"] - 0.2) * rate)),
-        )
-        body_to = min(len(samples), int(item["end"] * rate))
-        if body_to - search_from < frame * 3:
-            continue
-
-        # Порог считаем от громкости самой реплики, а не абсолютный.
-        body = samples[search_from:body_to]
-        peak = max((abs(v) for v in body), default=0)
-        if peak < 200:
-            continue
-        threshold = peak * 0.18
-
-        # Требуем, чтобы громкость держалась несколько кадров подряд: иначе
-        # короткий вздох или смешок принимается за начало фразы и дубляж
-        # вступает слишком рано.
-        position = search_from
-        found: float | None = None
-        streak = 0
-        needed = 25  # 250 мс непрерывной речи: смех и вздох столько не тянутся
-        while position + frame <= search_to:
-            chunk = samples[position : position + frame]
-            level = max(abs(v) for v in chunk)
-            if level >= threshold:
-                streak += 1
-                if streak >= needed:
-                    found = (position - frame * (needed - 1)) / rate
-                    break
-            else:
-                streak = 0
-            position += frame
-        if found is not None:
-            onsets[item["index"]] = max(0.0, found)
-    return onsets
+    refined = 0
+    for unit in units:
+        turn_start, turn_end = diarization.turn_bounds(unit.start, unit.end)
+        for position, chunk in enumerate(unit.chunks):
+            lower = max(0.0, turn_start if position == 0 else unit.chunks[position - 1].end)
+            upper = min(chunk.end - 0.05, turn_end if turn_end > chunk.start else chunk.end)
+            if upper <= lower:
+                chunk.onset = chunk.start
+                continue
+            onset = refine_lexical_onset(samples, rate, chunk.start, lower, upper)
+            if abs(onset - chunk.onset) > 0.005:
+                refined += 1
+            chunk.onset = max(0.0, onset)
+        if unit.chunks:
+            unit.start = unit.chunks[0].onset
+    return refined
 
 
-def detect_speaker_genders(audio: Path, segments: list[dict[str, Any]]) -> dict[int, str]:
-    """Определяет пол говорящего в каждой реплике по высоте голоса в оригинале.
+# -----------------------------------------------------------------------------
+# Модель длительности узбекской речи: слоги вместо символов
+#
+# Символы не отражают ни числа слогов, ни раскрытия цифр, ни агглютинативных
+# окончаний, ни скорости конкретного TTS-голоса. Поэтому длину перевода теперь
+# планируем через слоги и предсказанную длительность, а коэффициенты
+# калибруются на РЕАЛЬНЫХ генерациях конкретного голоса.
+# -----------------------------------------------------------------------------
 
-    Надёжнее догадки по тексту. Сначала считаем медианный питч каждой реплики,
-    затем делим реплики на два голоса кластеризацией — так работает и когда у
-    конкретного человека голос выше/ниже среднего.
+UZ_VOWELS = "aeiou"
+UZ_DIGRAPHS = ("sh", "ch", "ng")
+STRONG_BREAKS = (".", "!", "?", "…", ";", ":", "—")
+
+# Стартовый prior (до накопления калибровки), из отраслевых оценок:
+#   D = 0.12 + 0.17*слоги + 0.015*согласные + 0.03*слова
+PRIOR_COEFFS = (0.12, 0.17, 0.015, 0.03)
+PAUSE_PER_COMMA = 0.18
+PAUSE_PER_BREAK = 0.30
+CALIBRATION_MIN_SAMPLES = 40   # меньше — доверяем prior, а не шуму
+CALIBRATION_MAX_SAMPLES = 4000
+CALIBRATION_RIDGE = 1e-3
+CALIBRATION_PATH = JOBS_DIR / "tts_calibration.json"
+_calibration_lock = threading.Lock()
+_calibration_cache: dict[str, Any] = {}
+
+UZ_UNITS = ["", "bir", "ikki", "uch", "toʻrt", "besh", "olti", "yetti", "sakkiz", "toqqiz"]
+UZ_TENS = [
+    "", "oʻn", "yigirma", "oʻttiz", "qirq", "ellik",
+    "oltmish", "yetmish", "sakson", "toqson",
+]
+UZ_SIGNS = {
+    "%": " foiz ",
+    "$": " dollar ",
+    "€": " yevro ",
+    "₽": " rubl ",
+    "&": " va ",
+    "№": " raqam ",
+}
+# Сокращения читаются словами: «15 kg» — это 6 слогов, а не 5 символов.
+UZ_ABBREVIATIONS = {
+    "kg": "kilogramm",
+    "km": "kilometr",
+    "sm": "santimetr",
+    "mm": "millimetr",
+    "ml": "millilitr",
+    "gr": "gramm",
+    "soat": "soat",
+    "min": "minut",
+    "sek": "sekund",
+    "yil": "yil",
+}
+
+
+def _number_to_uzbek(value: int) -> str:
+    """Раскрывает число словами: «15» — это 2 слога, а не 2 символа."""
+    if value < 0:
+        return "minus " + _number_to_uzbek(-value)
+    if value == 0:
+        return "nol"
+    parts: list[str] = []
+    for scale, name in ((1_000_000_000, "milliard"), (1_000_000, "million"), (1000, "ming")):
+        if value >= scale:
+            count = value // scale
+            value %= scale
+            prefix = _number_to_uzbek(count) if count > 1 else ""
+            parts.append(f"{prefix} {name}".strip())
+    if value >= 100:
+        hundreds = value // 100
+        value %= 100
+        prefix = UZ_UNITS[hundreds] if hundreds > 1 else ""
+        parts.append(f"{prefix} yuz".strip())
+    if value >= 10:
+        parts.append(UZ_TENS[value // 10])
+        value %= 10
+    if value:
+        parts.append(UZ_UNITS[value])
+    return " ".join(part for part in parts if part)
+
+
+def normalize_uzbek(text: str) -> str:
+    """Приводит узбекский текст к единому виду перед подсчётом и озвучкой.
+
+    Единый апостроф в oʻ/gʻ, раскрытые числа, знаки и сокращения — иначе одна и
+    та же фраза даёт разные оценки длительности и разное чтение в TTS.
     """
-    genders: dict[int, str] = {}
-    try:
-        with wave.open(str(audio), "rb") as wav:
-            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
-                return genders
-            sample_rate = wav.getframerate()
-            raw = wav.readframes(wav.getnframes())
-    except (wave.Error, OSError):
-        return genders
+    normalized = re.sub(r"[’‘`´ʼ']", "ʻ", text)
+    for sign, word in UZ_SIGNS.items():
+        normalized = normalized.replace(sign, word)
+    normalized = re.sub(
+        r"\d+", lambda match: f" {_number_to_uzbek(int(match.group(0)))} ", normalized
+    )
+    normalized = re.sub(
+        r"\b(" + "|".join(UZ_ABBREVIATIONS) + r")\b",
+        lambda match: UZ_ABBREVIATIONS[match.group(1).lower()],
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
 
-    all_samples = array("h")
-    all_samples.frombytes(raw)
-    if sys.byteorder != "little":
-        all_samples.byteswap()
 
-    pitches: dict[int, float] = {}
-    for item in segments:
-        start = max(0, int(item["start"] * sample_rate))
-        end = min(len(all_samples), int(item["end"] * sample_rate))
-        if end - start < sample_rate // 5:
-            continue
-        pitch = _segment_pitch(all_samples[start:end], sample_rate)
-        if pitch > 0:
-            pitches[item["index"]] = pitch
+def uzbek_features(text: str) -> dict[str, int]:
+    """Слоги, согласные фонемы, слова и знаки — вход модели длительности."""
+    normalized = normalize_uzbek(text).lower()
+    words = [word for word in re.split(r"[^0-9a-zʻ]+", normalized) if word]
 
-    if not pitches:
-        return genders
+    syllables = 0
+    consonants = 0
+    long_words = 0
+    for word in words:
+        # Диграфы sh/ch/ng — одна согласная, а не две.
+        collapsed = word
+        for digraph in UZ_DIGRAPHS:
+            collapsed = collapsed.replace(digraph, "c")
+        collapsed = collapsed.replace("gʻ", "g").replace("oʻ", "o")
+        nuclei = sum(1 for letter in collapsed if letter in UZ_VOWELS)
+        nuclei = nuclei or 1  # слово без гласной всё равно произносится
+        syllables += nuclei
+        consonants += sum(1 for letter in collapsed if letter.isalpha() and letter not in UZ_VOWELS)
+        if nuclei >= 4:
+            long_words += 1
 
-    boundary = _split_two_speakers(list(pitches.values()))
-    if boundary is None:
-        # Один говорящий (или неотличимые голоса) — решаем по абсолютной границе.
-        values = sorted(pitches.values())
-        median = values[len(values) // 2]
-        label = "male" if median < PITCH_SPLIT_HZ else "female"
-        return {index: label for index in pitches}
+    return {
+        "syllables": syllables,
+        "consonants": consonants,
+        "words": len(words),
+        "long_words": long_words,
+        "commas": text.count(","),
+        "breaks": sum(text.count(sign) for sign in STRONG_BREAKS),
+    }
 
-    for index, pitch in pitches.items():
-        genders[index] = "male" if pitch < boundary else "female"
-    return genders
+
+def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
+    """Гаусс с выбором ведущего элемента — для нормальных уравнений регрессии."""
+    size = len(vector)
+    rows = [row[:] + [vector[index]] for index, row in enumerate(matrix)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(rows[row][column]))
+        if abs(rows[pivot][column]) < 1e-12:
+            return None
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        for row in range(column + 1, size):
+            factor = rows[row][column] / rows[column][column]
+            for position in range(column, size + 1):
+                rows[row][position] -= factor * rows[column][position]
+    solution = [0.0] * size
+    for column in range(size - 1, -1, -1):
+        total = rows[column][size] - sum(
+            rows[column][position] * solution[position] for position in range(column + 1, size)
+        )
+        solution[column] = total / rows[column][column]
+    return solution
+
+
+def _fit_duration_model(samples: list[dict[str, Any]]) -> tuple[list[float], float] | None:
+    """Ridge-регрессия длительности по измеренным генерациям одного голоса.
+
+    Возвращает коэффициенты [b0, слоги, согласные, слова] и 80-й перцентиль
+    остатка — запас, который используем как «квантильный» прогноз против
+    перелива (лучше немного недоговорить бюджет, чем вылезти за окно).
+    """
+    if len(samples) < CALIBRATION_MIN_SAMPLES:
+        return None
+    design = [
+        [1.0, float(item["syllables"]), float(item["consonants"]), float(item["words"])]
+        for item in samples
+    ]
+    target = [float(item["speech"]) for item in samples]
+    size = 4
+    matrix = [
+        [
+            sum(row[left] * row[right] for row in design)
+            + (CALIBRATION_RIDGE if left == right else 0.0)
+            for right in range(size)
+        ]
+        for left in range(size)
+    ]
+    vector = [
+        sum(row[index] * value for row, value in zip(design, target)) for index in range(size)
+    ]
+    coefficients = _solve(matrix, vector)
+    if coefficients is None or coefficients[1] <= 0:
+        return None  # бессмысленная модель (слоги не могут сокращать речь)
+    residuals = sorted(
+        value - sum(coefficient * feature for coefficient, feature in zip(coefficients, row))
+        for row, value in zip(design, target)
+    )
+    safety = max(0.0, residuals[int(len(residuals) * 0.8)])
+    return coefficients, safety
+
+
+def _load_calibration() -> dict[str, Any]:
+    with _calibration_lock:
+        if _calibration_cache:
+            return _calibration_cache
+        try:
+            data = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        _calibration_cache.update(data if isinstance(data, dict) else {})
+        return _calibration_cache
+
+
+def record_tts_duration(voice: str, text: str, measured: float) -> None:
+    """Складывает каждую генерацию в калибровочный набор этого голоса.
+
+    Так предсказание длительности со временем становится точным именно для
+    ваших голосов и стиля, а не «в среднем по языку».
+    """
+    if measured <= 0.2:
+        return
+    features = uzbek_features(text)
+    if features["syllables"] <= 0:
+        return
+    sample = {
+        "syllables": features["syllables"],
+        "consonants": features["consonants"],
+        "words": features["words"],
+        "speech": round(measured, 3),
+    }
+    with _calibration_lock:
+        try:
+            data = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        samples = data.setdefault(voice, [])
+        if isinstance(samples, list):
+            samples.append(sample)
+            del samples[:-CALIBRATION_MAX_SAMPLES]
+        data[voice] = samples
+        try:
+            CALIBRATION_PATH.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            return
+        _calibration_cache.clear()
+        _calibration_cache.update(data)
+
+
+def duration_model(voice: str) -> tuple[list[float], float]:
+    """Коэффициенты для голоса: калибровка, если данных хватает, иначе prior."""
+    data = _load_calibration()
+    samples = data.get(voice)
+    if isinstance(samples, list):
+        fitted = _fit_duration_model([item for item in samples if isinstance(item, dict)])
+        if fitted:
+            return fitted
+    return list(PRIOR_COEFFS), 0.0
+
+
+def predict_speech_duration(text: str, voice: str, safe: bool = False) -> float:
+    """Предсказанная длительность произнесения (без внутренних пауз)."""
+    features = uzbek_features(text)
+    coefficients, safety = duration_model(voice)
+    predicted = (
+        coefficients[0]
+        + coefficients[1] * features["syllables"]
+        + coefficients[2] * features["consonants"]
+        + coefficients[3] * features["words"]
+    )
+    if safe:
+        predicted += safety
+    return max(0.2, predicted)
+
+
+def predict_total_duration(text: str, voice: str, safe: bool = False) -> float:
+    """С учётом пунктуационных пауз — когда фраза озвучивается одним куском."""
+    features = uzbek_features(text)
+    return (
+        predict_speech_duration(text, voice, safe)
+        + PAUSE_PER_COMMA * features["commas"]
+        + PAUSE_PER_BREAK * max(0, features["breaks"] - 1)
+    )
+
+
+def predict_unit_duration(unit: DubSegment, voice: str, safe: bool = False) -> float:
+    """Прогноз по реплике: сумма дыхательных групп (пауз между ними тут нет —
+    они берутся из оригинала при раскладке на таймлайне)."""
+    parts = [chunk.text for chunk in unit.chunks if chunk.text.strip()]
+    if parts:
+        return sum(predict_total_duration(part, voice, safe) for part in parts)
+    return predict_total_duration(unit.translated_text, voice, safe)
+
+
+def syllable_budget(seconds: float, voice: str) -> int:
+    """Сколько слогов реально влезает в окно — это и есть цель для перевода."""
+    coefficients, _ = duration_model(voice)
+    # Средние соотношения узбекской речи: ~1.5 согласной и ~0.4 слова на слог.
+    per_syllable = coefficients[1] + 1.5 * coefficients[2] + 0.4 * coefficients[3]
+    if per_syllable <= 0.01:
+        per_syllable = PRIOR_COEFFS[1]
+    return max(1, int((max(0.3, seconds) - coefficients[0]) / per_syllable))
 
 
 def _clean_words(text: str) -> str:
@@ -1110,8 +1595,31 @@ def _clean_words(text: str) -> str:
     return re.sub(r"\s+([,.!?…:;])", r"\1", text)
 
 
-def transcribe(audio: Path, language: str | None) -> list[dict[str, Any]]:
-    segments_iterator, _ = whisper_model().transcribe(
+def _words_from_segment(start: float, end: float, text: str) -> list[Word]:
+    """Аварийный разбор: если ASR не дал пословных меток, раскладываем слова
+    по длине токенов. Хуже настоящего alignment, но структура не ломается."""
+    tokens = [token for token in text.split() if token]
+    if not tokens or end <= start:
+        return []
+    weights = [max(1, len(token)) for token in tokens]
+    total = float(sum(weights))
+    words: list[Word] = []
+    position = start
+    for token, weight in zip(tokens, weights):
+        span = (end - start) * weight / total
+        words.append(Word(start=position, end=position + span, text=token, score=0.0))
+        position += span
+    return words
+
+
+def transcribe(audio: Path, language: str | None) -> tuple[list[Word], str]:
+    """Уровень 1: слова с временными метками. Никакой нарезки на «фразы» здесь нет.
+
+    Раньше слова тут же склеивались в фразы по 3.2 с и выбрасывались; теперь
+    пословные метки живут до самого конца: из них считаются лексическое начало,
+    внутренние паузы, границы дыхательных групп и назначение говорящего.
+    """
+    segments_iterator, info = whisper_model().transcribe(
         str(audio),
         language=language,
         beam_size=5,
@@ -1120,47 +1628,531 @@ def transcribe(audio: Path, language: str | None) -> list[dict[str, Any]]:
         condition_on_previous_text=False,
     )
 
-    words: list[tuple[float, float, str]] = []
-    fallback: list[tuple[float, float, str]] = []
+    words: list[Word] = []
     for segment in segments_iterator:
-        seg_text = segment.text.strip()
-        if seg_text and segment.end > segment.start:
-            fallback.append((float(segment.start), float(segment.end), seg_text))
+        collected: list[Word] = []
         for word in getattr(segment, "words", None) or []:
             token = (word.word or "").strip()
             if token and word.end > word.start:
-                words.append((float(word.start), float(word.end), token))
+                score = getattr(word, "probability", None)
+                collected.append(
+                    Word(
+                        start=float(word.start),
+                        end=float(word.end),
+                        text=token,
+                        score=float(score) if score is not None else 1.0,
+                    )
+                )
+        if collected:
+            words.extend(collected)
+            continue
+        seg_text = (segment.text or "").strip()
+        if seg_text and segment.end > segment.start:
+            words.extend(_words_from_segment(float(segment.start), float(segment.end), seg_text))
 
+    words.sort(key=lambda item: item.start)
+    if not words:
+        raise RuntimeError("В видео не найдена речь")
+    detected = str(getattr(info, "language", "") or language or "")
+    return words, detected
+
+
+def _alignment_enabled() -> bool:
+    return os.getenv("FORCED_ALIGNMENT", "auto").strip().lower() not in {"0", "off", "no", "false"}
+
+
+def forced_align(audio: Path, words: list[Word], language: str) -> list[Word]:
+    """Forced alignment (WhisperX/CTC): уточняет границы слов по самому аудио.
+
+    Whisper ставит метки «на глазок» и часто открывает реплику на вздохе или
+    смешке за секунду до первого слова. Alignment-модель выравнивает УЖЕ
+    известный текст с аудио, поэтому начало реплики попадает на реальный
+    первый лексический звук. Если whisperx не установлен — работаем на метках
+    Whisper, точность ниже, но пайплайн не падает.
+    """
+    if not words or not _alignment_enabled():
+        return words
+    try:
+        import whisperx  # type: ignore[import-not-found]
+    except Exception:
+        print(
+            "[dubbing] forced alignment недоступен (нет whisperx) — "
+            "работаем на пословных метках Whisper",
+            flush=True,
+        )
+        return words
+
+    groups = group_words(words, max_gap=UTTERANCE_GAP, max_span=UTTERANCE_MAX_SECONDS)
+    payload = [
+        {
+            "start": group[0].start,
+            "end": group[-1].end,
+            "text": _clean_words(" ".join(word.text for word in group)),
+        }
+        for group in groups
+    ]
+    try:
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        model, metadata = whisperx.load_align_model(
+            language_code=(language or "en")[:2], device=device
+        )
+        aligned = whisperx.align(payload, model, metadata, str(audio), device)
+    except Exception as exc:  # модель языка может отсутствовать — это не фатально
+        print(f"[dubbing] forced alignment не выполнен: {exc}", flush=True)
+        return words
+
+    result: list[Word] = []
+    for item in aligned.get("word_segments") or []:
+        token = str(item.get("word", "")).strip()
+        start, end = item.get("start"), item.get("end")
+        if not token or start is None or end is None or float(end) <= float(start):
+            continue
+        result.append(
+            Word(
+                start=float(start),
+                end=float(end),
+                text=token,
+                score=float(item.get("score") or 0.0),
+            )
+        )
+    if len(result) < max(3, int(len(words) * 0.6)):
+        print("[dubbing] alignment вернул слишком мало слов — оставляем метки Whisper", flush=True)
+        return words
+    result.sort(key=lambda item: item.start)
+    print(f"[dubbing] forced alignment: уточнено слов {len(result)}", flush=True)
+    return result
+
+
+def group_words(
+    words: list[Word],
+    max_gap: float,
+    max_span: float,
+    sentence_flush: float = 0.0,
+    boundary: Callable[[Word, Word], bool] | None = None,
+) -> list[list[Word]]:
+    """Общая нарезка потока слов. Один инструмент — разные параметры для разных
+    уровней: черновые utterance для диаризации, translation units, дыхательные
+    группы. Раньше все уровни делил один и тот же лимит 3.2 с."""
+    groups: list[list[Word]] = []
+    current: list[Word] = []
+    for word in words:
+        if current:
+            gap = word.start - current[-1].end
+            span = word.end - current[0].start
+            ends_sentence = current[-1].text.endswith(SENTENCE_END)
+            reached = current[-1].end - current[0].start
+            split = gap >= max_gap or span > max_span
+            if sentence_flush and ends_sentence and reached >= sentence_flush:
+                split = True
+            if boundary is not None and boundary(current[-1], word):
+                split = True
+            if split:
+                groups.append(current)
+                current = []
+        current.append(word)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def utterances_for_diarization(words: list[Word]) -> list[dict[str, Any]]:
+    """Черновые реплики для диаризации: делим только по заметным паузам.
+
+    Диаризацию нельзя кормить обрывками по 0.5-1 с — на таком куске просто нет
+    акустических данных. Поэтому здесь куски длиннее, чем translation units.
+    """
+    groups = group_words(words, max_gap=UTTERANCE_GAP, max_span=UTTERANCE_MAX_SECONDS)
     result: list[dict[str, Any]] = []
-
-    def flush(chunk: list[tuple[float, float, str]]) -> None:
-        if not chunk:
-            return
-        text = _clean_words(" ".join(w[2] for w in chunk))
-        start, end = chunk[0][0], chunk[-1][1]
-        if text and end > start:
-            result.append({"index": len(result), "start": start, "end": end, "text": text})
-
-    if words:
-        # Пословные метки -> режем на фразы по паузам, концам предложений и длине.
-        chunk: list[tuple[float, float, str]] = []
-        for word_start, word_end, token in words:
-            if chunk:
-                gap = word_start - chunk[-1][1]
-                span = word_end - chunk[0][0]
-                prev_ends_sentence = chunk[-1][2].endswith(SENTENCE_END)
-                if gap > CHUNK_GAP_SECONDS or span > CHUNK_MAX_SECONDS or prev_ends_sentence:
-                    flush(chunk)
-                    chunk = []
-            chunk.append((word_start, word_end, token))
-        flush(chunk)
-    else:
-        for start, end, text in fallback:
-            result.append({"index": len(result), "start": start, "end": end, "text": text})
-
+    for group in groups:
+        text = _clean_words(" ".join(word.text for word in group))
+        if not text:
+            continue
+        result.append(
+            {
+                "index": len(result),
+                "start": group[0].start,
+                "end": group[-1].end,
+                "text": text,
+                "words": group,
+            }
+        )
     if not result:
         raise RuntimeError("В видео не найдена речь")
     return result
+
+
+# -----------------------------------------------------------------------------
+# Уровень 2: диаризация (кто говорит) — по ВСЕМУ аудио, а не по коротким фразам
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class Diarization:
+    """Результат диаризации: speaker turns + участки наложения голосов."""
+
+    turns: list[SpeakerTurn] = field(default_factory=list)
+    overlaps: list[tuple[float, float]] = field(default_factory=list)
+    genders: dict[str, str] = field(default_factory=dict)  # мнение модели — только подсказка
+    backend: str = "none"
+
+    @property
+    def speakers(self) -> list[str]:
+        return sorted({turn.speaker for turn in self.turns})
+
+    def speaker_at(self, start: float, end: float) -> str:
+        """Говорящий с максимальным перекрытием по времени."""
+        best_label, best_overlap = "", 0.0
+        for turn in self.turns:
+            shared = min(end, turn.end) - max(start, turn.start)
+            if shared > best_overlap:
+                best_label, best_overlap = turn.speaker, shared
+        if best_label:
+            return best_label
+        # Ни один turn не покрывает интервал — берём ближайший по времени.
+        nearest, distance = "", float("inf")
+        centre = (start + end) / 2
+        for turn in self.turns:
+            gap = min(abs(turn.start - centre), abs(turn.end - centre))
+            if gap < distance:
+                nearest, distance = turn.speaker, gap
+        return nearest
+
+    def overlap_ratio(self, start: float, end: float) -> float:
+        span = max(1e-6, end - start)
+        shared = 0.0
+        for over_start, over_end in self.overlaps:
+            shared += max(0.0, min(end, over_end) - max(start, over_start))
+        return min(1.0, shared / span)
+
+    def turn_bounds(self, start: float, end: float) -> tuple[float, float]:
+        """Границы turn, внутри которого лежит интервал — за них онсет не выносим."""
+        label = self.speaker_at(start, end)
+        for turn in self.turns:
+            if turn.speaker == label and turn.start - 0.05 <= start and end <= turn.end + 0.05:
+                return turn.start, turn.end
+        return start, end
+
+
+def _merge_turns(raw: list[tuple[float, float, str]]) -> list[SpeakerTurn]:
+    """Склеивает соседние участки одного говорящего в непрерывный turn.
+
+    Никакого ограничения длины: turn — это столько, сколько человек говорил.
+    """
+    turns: list[SpeakerTurn] = []
+    for start, end, label in sorted(raw, key=lambda item: item[0]):
+        if end <= start:
+            continue
+        if turns and turns[-1].speaker == label and start - turns[-1].end <= TURN_MERGE_GAP:
+            turns[-1].end = max(turns[-1].end, end)
+            continue
+        turns.append(SpeakerTurn(speaker=label, start=start, end=end))
+    return turns
+
+
+def _overlap_regions(raw: list[tuple[float, float, str]]) -> list[tuple[float, float]]:
+    """Участки, где одновременно звучат два разных говорящих (cross-talk)."""
+    regions: list[tuple[float, float]] = []
+    ordered = sorted(raw, key=lambda item: item[0])
+    for position, (start, end, label) in enumerate(ordered):
+        for other_start, other_end, other_label in ordered[position + 1 :]:
+            if other_start >= end:
+                break
+            if other_label == label:
+                continue
+            shared_start, shared_end = max(start, other_start), min(end, other_end)
+            if shared_end - shared_start >= 0.10:  # короче 100 мс — не считаем
+                regions.append((shared_start, shared_end))
+    regions.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in regions:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def pyannote_diarization(audio: Path) -> Diarization | None:
+    """Диаризация pyannote по всему файлу — рекомендуемый путь.
+
+    Модель даёт speaker turns, embeddings-кластеризацию и разметку наложений,
+    то есть именно то, чего не может дать LLM по короткой реплике. Запускается
+    на ЦЕЛОМ аудио: короткая реплика наследует личность говорящего от его
+    длинных реплик, а не угадывается заново.
+    """
+    backend = os.getenv("DIARIZATION_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "pyannote"}:
+        return None
+    try:
+        from pyannote.audio import Pipeline  # type: ignore[import-not-found]
+    except Exception:
+        if backend == "pyannote":
+            print("[dubbing] pyannote.audio не установлен — диаризация через Gemini", flush=True)
+        return None
+
+    model = os.getenv("PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1")
+    token = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or "").strip() or None
+    options: dict[str, int] = {}
+    exact = os.getenv("NUM_SPEAKERS", "").strip()
+    if exact.isdigit() and int(exact) > 0:
+        # Если число говорящих известно — задаём точно, это заметно снижает DER.
+        options["num_speakers"] = int(exact)
+    else:
+        minimum = os.getenv("MIN_SPEAKERS", "").strip()
+        maximum = os.getenv("MAX_SPEAKERS", "").strip()
+        if minimum.isdigit():
+            options["min_speakers"] = int(minimum)
+        if maximum.isdigit():
+            options["max_speakers"] = int(maximum)
+    try:
+        pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
+        if pipeline is None:
+            raise RuntimeError("pyannote не отдал pipeline (нужен доступ к модели и HF_TOKEN)")
+        annotation = pipeline(str(audio), **options)
+        raw = [
+            (float(segment.start), float(segment.end), str(label))
+            for segment, _, label in annotation.itertracks(yield_label=True)
+        ]
+    except Exception as exc:
+        print(f"[dubbing] pyannote не сработал ({exc}) — диаризация через Gemini", flush=True)
+        return None
+    if not raw:
+        return None
+    return Diarization(
+        turns=_merge_turns(raw),
+        overlaps=_overlap_regions(raw),
+        backend="pyannote",
+    )
+
+
+def smooth_labels(
+    utterances: list[dict[str, Any]], labels: dict[int, str]
+) -> dict[int, str]:
+    """Temporal smoothing: одиночная короткая реплика не может «сменить» говорящего.
+
+    Именно этот случай ломался раньше: на 0.5-2 с модель угадывала тембр и
+    выдавала нового говорящего посреди монолога. Если сосед слева и справа —
+    один и тот же человек, короткая реплика достаётся ему.
+    """
+    smoothed = dict(labels)
+    for position, item in enumerate(utterances):
+        index = item["index"]
+        current = smoothed.get(index)
+        if not current:
+            continue
+        duration = float(item["end"]) - float(item["start"])
+        if duration > SHORT_TURN_SECONDS:
+            continue
+        previous = smoothed.get(utterances[position - 1]["index"]) if position else None
+        following = (
+            smoothed.get(utterances[position + 1]["index"])
+            if position + 1 < len(utterances)
+            else None
+        )
+        if previous and previous == following and previous != current:
+            smoothed[index] = previous
+    # Реплика без метки наследует метку предыдущей — «unknown» лучше не плодить.
+    last = ""
+    for item in utterances:
+        index = item["index"]
+        if smoothed.get(index):
+            last = smoothed[index]
+        elif last:
+            smoothed[index] = last
+    return smoothed
+
+
+def gemini_diarization(
+    client: GeminiClient, audio: Path, utterances: list[dict[str, Any]]
+) -> Diarization:
+    """Резервная диаризация: Gemini слушает всё аудио и метит черновые реплики.
+
+    Слабее pyannote (нет frame-level posterior, embeddings и разметки наложений),
+    поэтому сверху обязательно идёт temporal smoothing.
+    """
+    labels, genders = client.identify_speakers(audio, utterances)
+    if not labels:
+        return Diarization(backend="none")
+    labels = smooth_labels(utterances, labels)
+    raw = [
+        (float(item["start"]), float(item["end"]), labels[item["index"]])
+        for item in utterances
+        if labels.get(item["index"])
+    ]
+    if not raw:
+        return Diarization(backend="none")
+    return Diarization(turns=_merge_turns(raw), genders=genders, backend="gemini")
+
+
+def diarize(
+    client: GeminiClient, audio: Path, duration: float, utterances: list[dict[str, Any]]
+) -> Diarization:
+    result = pyannote_diarization(audio)
+    if result is None or not result.turns:
+        result = gemini_diarization(client, audio, utterances)
+    if not result.turns:
+        # Совсем ничего не получилось — считаем, что говорящий один.
+        result = Diarization(
+            turns=[SpeakerTurn(speaker="S1", start=0.0, end=max(duration, 0.1))],
+            backend="single",
+        )
+    for turn in result.turns:
+        turn.overlap = result.overlap_ratio(turn.start, turn.end)
+    return result
+
+
+def assign_word_speakers(words: list[Word], diarization: Diarization) -> None:
+    for word in words:
+        word.speaker = diarization.speaker_at(word.start, word.end)
+
+
+# -----------------------------------------------------------------------------
+# Уровни 3 и 4: translation units и дыхательные группы
+# -----------------------------------------------------------------------------
+
+CLAUSE_END = (",", ";", ":", "—", "-")
+
+
+def build_chunks(words: list[Word]) -> list[DubChunk]:
+    """Режет unit на дыхательные группы по РЕАЛЬНЫМ паузам между словами.
+
+    Пауза оригинала здесь не «съедается» и не отдаётся на волю TTS: каждая
+    группа потом ставится на своё лексическое начало, поэтому пауза
+    воспроизводится ровно той длины, которую сделал актёр.
+    """
+    groups = group_words(words, max_gap=CHUNK_PAUSE_MIN, max_span=CHUNK_MAX_SECONDS)
+    chunks: list[DubChunk] = []
+    for group in groups:
+        text = _clean_words(" ".join(word.text for word in group))
+        if not text:
+            continue
+        chunks.append(
+            DubChunk(
+                start=group[0].start,
+                end=group[-1].end,
+                source_text=text,
+                onset=group[0].start,
+            )
+        )
+    return chunks
+
+
+def split_text_by_chunks(text: str, chunks: list[DubChunk]) -> list[str]:
+    """Резервная раскладка перевода по дыхательным группам.
+
+    Используется, если модель не вернула готовые части: делим по словам
+    пропорционально длительности групп, стараясь попасть на знак препинания.
+    """
+    if len(chunks) <= 1:
+        return [text]
+    words = text.split()
+    if len(words) < len(chunks):
+        # Слов меньше, чем групп: озвучиваем всё первой группой, остальные молчат.
+        return [text] + [""] * (len(chunks) - 1)
+
+    total = sum(chunk.duration for chunk in chunks) or 1.0
+    parts: list[str] = []
+    position = 0
+    for number, chunk in enumerate(chunks):
+        remaining_chunks = len(chunks) - number - 1
+        if remaining_chunks == 0:
+            parts.append(" ".join(words[position:]))
+            break
+        share = chunk.duration / total
+        take = max(1, round(share * len(words)))
+        take = min(take, len(words) - position - remaining_chunks)
+        # Подтягиваем границу к ближайшему знаку препинания (±1 слово).
+        for shift in (0, 1, -1):
+            candidate = position + take + shift
+            if position < candidate < len(words) - remaining_chunks:
+                if words[candidate - 1].rstrip().endswith(CLAUSE_END + SENTENCE_END):
+                    take += shift
+                    break
+        parts.append(" ".join(words[position : position + take]))
+        position += take
+    return parts
+
+
+def build_units(words: list[Word], diarization: Diarization) -> list[DubSegment]:
+    """Собирает translation units: смысловой блок ~4-12 с внутри ОДНОГО говорящего.
+
+    Границы: смена говорящего, пауза >= UNIT_SPLIT_GAP, конец предложения после
+    UNIT_FLUSH_SECONDS, запятая после UNIT_TARGET_SECONDS, жёсткий предел
+    UNIT_MAX_SECONDS. Ни одного искусственного лимита в 3.2 с больше нет —
+    перевод получает целое предложение, а не обрубок.
+    """
+
+    def boundary(previous: Word, following: Word) -> bool:
+        if previous.speaker != following.speaker:
+            return True  # unit никогда не пересекает границу speaker turn
+        return False
+
+    groups: list[list[Word]] = []
+    for group in group_words(
+        words,
+        max_gap=UNIT_SPLIT_GAP,
+        max_span=UNIT_MAX_SECONDS,
+        sentence_flush=UNIT_FLUSH_SECONDS,
+        boundary=boundary,
+    ):
+        # Длинный блок без точек дорезаем по запятой, чтобы не уехать к 12 с.
+        current: list[Word] = []
+        for word in group:
+            if (
+                current
+                and word.end - current[0].start > UNIT_TARGET_SECONDS
+                and current[-1].text.rstrip().endswith(CLAUSE_END)
+            ):
+                groups.append(current)
+                current = []
+            current.append(word)
+        if current:
+            groups.append(current)
+
+    units: list[DubSegment] = []
+    for group in groups:
+        text = _clean_words(" ".join(word.text for word in group))
+        if not text:
+            continue
+        chunks = build_chunks(group)
+        if not chunks:
+            continue
+        start, end = group[0].start, group[-1].end
+        label = diarization.speaker_at(start, end) or "S1"
+        units.append(
+            DubSegment(
+                index=len(units),
+                start=start,
+                end=end,
+                source_text=text,
+                speaker_label=label,
+                chunks=chunks,
+                overlap=diarization.overlap_ratio(start, end),
+            )
+        )
+    if not units:
+        raise RuntimeError("В видео не найдена речь")
+    return units
+
+
+def assign_chunk_budgets(units: list[DubSegment], duration: float) -> None:
+    """Бюджет каждой дыхательной группы: до начала следующей группы (любого unit).
+
+    Считаем по всей ленте, а не внутри реплики: так узбекская группа не
+    наезжает на следующую и при этом договаривается до конца.
+    """
+    chunks = sorted(
+        (chunk for unit in units for chunk in unit.chunks), key=lambda item: item.onset
+    )
+    for position, chunk in enumerate(chunks):
+        if position + 1 < len(chunks):
+            limit = chunks[position + 1].onset
+        else:
+            limit = duration
+        window = max(0.4, limit - chunk.onset)
+        # Небольшой хвост за окно допустим (слова договариваются), но тянуться
+        # дольше, чем говорил человек, реплика не должна.
+        chunk.budget = max(0.4, min(window, chunk.duration + TAIL_TOLERANCE))
 
 
 def atempo_filter(ratio: float) -> str:
@@ -1175,35 +2167,67 @@ def atempo_filter(ratio: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
+_stretch_filter_cache: dict[str, bool] = {}
+
+
+def has_rubberband() -> bool:
+    """Есть ли в сборке FFmpeg фильтр rubberband.
+
+    Обычный phase vocoder размывает транзиенты и согласные; rubberband с
+    обработкой транзиентов звучит заметно лучше при растяжении больше пары
+    процентов. Если его нет — остаёмся на atempo в безопасном диапазоне.
+    """
+    if "rubberband" not in _stretch_filter_cache:
+        try:
+            result = run_command(["ffmpeg", "-hide_banner", "-filters"], timeout=30)
+            _stretch_filter_cache["rubberband"] = bool(
+                re.search(r"^\s*\S+\s+rubberband\s", result.stdout, re.MULTILINE)
+            )
+        except RuntimeError:
+            _stretch_filter_cache["rubberband"] = False
+    return _stretch_filter_cache["rubberband"]
+
+
+def stretch_filter(ratio: float) -> str:
+    if has_rubberband():
+        return f"rubberband=tempo={ratio:.6f}:pitchq=quality:transients=crisp"
+    return atempo_filter(ratio)
+
+
+def fit_ratio(actual: float, budget: float, source_seconds: float, speech_speed: float) -> float:
+    """Сколько нужно изменить темп — с жёсткими рабочими границами.
+
+    Растяжение здесь — ПОСЛЕДНЯЯ ступень: текст уже подогнан по слогам, а TTS
+    уже просили говорить быстрее. Поэтому диапазон узкий: 0.92-1.15, и только
+    для коротких реплик (<2.5 с) разрешён аварийный предел 1.25 — на них
+    ускорение почти не слышно, а вылет за окно слышен сразу.
+    """
+    ratio = 1.0
+    if actual > budget:
+        ratio = actual / max(budget, 0.2)
+    elif actual < source_seconds * 0.92:
+        # Реплика короче окна: чуть растягиваем, чтобы губы не «доигрывали» молча.
+        ratio = actual / max(source_seconds, 0.25)
+    ceiling = EMERGENCY_SPEED_UP if source_seconds < 2.5 else MAX_SPEED_UP_RATIO
+    ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), ceiling)
+    # Пользовательская скорость речи — поверх, но всё ещё в разумных пределах.
+    return min(max(ratio * speech_speed, 0.85), max(ceiling, 1.15))
+
+
 def normalize_and_fit(
     source: Path,
     output: Path,
     target_seconds: float,
     max_seconds: float,
     speech_speed: float = 1.0,
-) -> None:
-    """Подгоняет длину реплики: target — окно оригинала, max — предел до следующей."""
+) -> float:
+    """Финальная подгонка длины. Возвращает применённое изменение темпа."""
     actual = media_duration(source)
-    # Реплика стоит на своём времени, поэтому должна уложиться в своё окно
-    # (до начала следующей). Сначала пробуем уложиться ускорением — умеренным,
-    # чтобы не было скороговорки. Обрезаем только в крайнем случае.
-    window = max(max_seconds, 0.3)
-    # Небольшой хвост за окном допустим: на слух это не перебивание, зато слова
-    # договариваются до конца. Жёстко режем только если вылезает совсем сильно.
-    # НИКАКОЙ обрезки: реплика всегда договаривается до конца. Чтобы она при этом
-    # не сильно вылезала за своё окно, только умеренно ускоряем.
-    ratio = 1.0
-    if actual > window:
-        ratio = actual / window
-    elif actual < target_seconds * 0.92:
-        ratio = actual / max(target_seconds, 0.25)
-    ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), MAX_SPEED_UP_RATIO)
-    # Пользовательская скорость: <1 — медленнее, >1 — быстрее.
-    ratio = min(max(ratio * speech_speed, 0.7), 1.35)
+    ratio = fit_ratio(actual, max(max_seconds, 0.3), target_seconds, speech_speed)
 
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
-        chain.append(atempo_filter(ratio))
+        chain.append(stretch_filter(ratio))
     final_length = actual / ratio
     # Более длинные микрофейды полностью убирают щелчки на стыках реплик.
     chain.append("afade=t=in:st=0:d=0.02")
@@ -1215,6 +2239,7 @@ def normalize_and_fit(
         ],
         timeout=180,
     )
+    return ratio
 
 
 def read_mono_pcm(path: Path) -> array:
@@ -1260,16 +2285,19 @@ def normalize_clip_level(clip: array) -> array:
     )
 
 
-def trim_lead_silence(source: Path, output: Path) -> None:
-    """Убирает тишину/паузу в начале реплики, чтобы слова начинались сразу.
+def trim_edge_silence(source: Path, output: Path) -> None:
+    """Убирает случайную тишину В НАЧАЛЕ И В КОНЦЕ сгенерированной группы.
 
-    Gemini TTS иногда добавляет паузу перед речью — из-за неё вся озвучка съезжает
-    и звучит не вовремя. Обрезаем ведущую тишину, оставляя лишь 20 мс.
+    Паузы задаёт фильм, а не TTS: каждая дыхательная группа ставится на своё
+    лексическое начало, поэтому её собственные краевые тишины только сбивают
+    синхрон. Внутренние паузы группы при этом не трогаем.
     """
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source),
-            "-af", "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.02",
+            "-af",
+            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.02:"
+            "stop_periods=-1:stop_threshold=-45dB:stop_silence=0.06:detection=peak",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=120,
@@ -1282,24 +2310,80 @@ def trim_lead_silence(source: Path, output: Path) -> None:
         shutil.copyfile(source, output)
 
 
-def _generate_segment(
+def _generate_chunk(
     client: GeminiClient,
     segment: DubSegment,
-    budget: float,
+    chunk: DubChunk,
+    position: int,
     voice_map: dict[str, str],
     scene: str,
     segments_dir: Path,
     speech_speed: float = 1.0,
 ) -> tuple[Path, str, str]:
-    raw = segments_dir / f"{segment.index:04d}-raw.wav"
-    trimmed = segments_dir / f"{segment.index:04d}-trim.wav"
-    fitted = segments_dir / f"{segment.index:04d}.wav"
+    """Озвучивает одну дыхательную группу с контекстом всей реплики.
+
+    Порядок борьбы с переливом строго такой:
+      1) текст уже подогнан под слоговой бюджет (condense_to_budget);
+      2) если сгенерированное всё равно длиннее бюджета более чем на 15% —
+         просим TTS говорить быстрее и, если есть, берём короткий вариант;
+      3) только остаток добираем растяжением в диапазоне 0.92-1.15.
+    """
+    name = f"{segment.index:04d}-{position:02d}"
+    raw = segments_dir / f"{name}-raw.wav"
+    trimmed = segments_dir / f"{name}-trim.wav"
+    fitted = segments_dir / f"{name}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
-    spoken_text = segment.translated_text
-    # Текст НЕ сокращаем: перевод произносится целиком, слова не выбрасываются.
-    client.tts(spoken_text, voice, raw, budget, segment.style, scene, segment.speaker)
-    trim_lead_silence(raw, trimmed)
-    normalize_and_fit(trimmed, fitted, segment.duration, budget, speech_speed)
+    spoken_text = chunk.text.strip() or segment.translated_text
+    budget = max(0.4, chunk.budget or chunk.duration)
+
+    client.tts(
+        spoken_text,
+        voice,
+        raw,
+        budget,
+        segment.style,
+        scene,
+        segment.speaker,
+        context=segment.translated_text,
+    )
+    trim_edge_silence(raw, trimmed)
+    measured = media_duration(trimmed)
+    record_tts_duration(voice, spoken_text, measured)
+
+    if measured > budget * REGENERATE_OVERFLOW:
+        # Перегенерация: сначала подача и более короткий текст, и только потом DSP.
+        retry_text = spoken_text
+        if (
+            len(segment.chunks) == 1
+            and segment.short_variant
+            and predict_speech_duration(segment.short_variant, voice)
+            < predict_speech_duration(spoken_text, voice)
+        ):
+            retry_text = segment.short_variant
+        retry_raw = segments_dir / f"{name}-raw2.wav"
+        retry_trimmed = segments_dir / f"{name}-trim2.wav"
+        try:
+            client.tts(
+                retry_text,
+                voice,
+                retry_raw,
+                budget,
+                segment.style,
+                scene,
+                segment.speaker,
+                context=segment.translated_text,
+                pace="faster",
+            )
+            trim_edge_silence(retry_raw, retry_trimmed)
+            retry_measured = media_duration(retry_trimmed)
+            record_tts_duration(voice, retry_text, retry_measured)
+            if retry_measured < measured:
+                trimmed, measured, spoken_text = retry_trimmed, retry_measured, retry_text
+        except RuntimeError:
+            pass  # перегенерация необязательна: остаётся первый вариант
+
+    chunk.generated = measured
+    chunk.ratio = normalize_and_fit(trimmed, fitted, chunk.duration, budget, speech_speed)
     return fitted, spoken_text, voice
 
 
@@ -1321,93 +2405,83 @@ def render_timeline(
     transcript: list[dict[str, Any]] = []
 
     ordered = sorted(segments, key=lambda s: s.start)
-    # Бюджет = окно оригинала + пауза до следующей реплики. Небольшой зазор перед
-    # следующей фразой сохраняем, чтобы реплики не наезжали и диалог звучал живо.
-    budgets: dict[int, float] = {}
-    for position, segment in enumerate(ordered):
-        if position + 1 < len(ordered):
-            next_start = ordered[position + 1].start
-            if next_start < segment.end - SOURCE_OVERLAP_EPS:
-                # В оригинале этого человека перебивают — сохраняем его окно,
-                # наложение получится ровно такое же, как в видео.
-                budget = segment.duration
-            else:
-                gap = max(0.0, next_start - segment.end)
-                reserve = min(0.12, gap * 0.35)  # оставляем паузу перед ответом
-                budget = next_start - segment.start - reserve
-        else:
-            budget = duration - segment.start
-        # Реплика не должна тянуться дольше, чем говорил человек в оригинале:
-        # иначе голос звучит на кадрах молчания, а паузы-жесты пропадают.
-        budget = min(budget, segment.duration + TAIL_TOLERANCE)
-        budgets[segment.index] = max(0.6, budget)
+    # Озвучиваем ДЫХАТЕЛЬНЫМИ ГРУППАМИ: каждая ставится на своё лексическое
+    # начало, поэтому внутренние паузы оригинала воспроизводятся как есть, а не
+    # отдаются на усмотрение TTS.
+    tasks: list[tuple[DubSegment, int, DubChunk]] = [
+        (unit, position, chunk)
+        for unit in ordered
+        for position, chunk in enumerate(unit.chunks)
+        if chunk.text.strip()
+    ]
+    if not tasks:
+        raise RuntimeError("Нет текста для озвучки")
 
-    males = sum(1 for s in ordered if s.speaker == "male")
+    males = sum(1 for unit in ordered if unit.speaker == "male")
     print(
-        f"[dubbing] реплик: {len(ordered)} (мужских {males}, женских {len(ordered) - males})",
+        f"[dubbing] реплик: {len(ordered)} (низкий регистр {males}, "
+        f"высокий {len(ordered) - males}), дыхательных групп: {len(tasks)}",
         flush=True,
     )
-    for segment in ordered:
-        mark = "М" if segment.speaker == "male" else "Ж"
+    for unit in ordered:
+        mark = "М" if unit.speaker == "male" else "Ж"
+        voice = voice_map.get(unit.speaker, voice_map["female"])
+        predicted = predict_speech_duration(unit.translated_text, voice)
         print(
-            f"[dubbing]   {segment.start:6.2f}s {mark} "
-            f"[{len(segment.source_text):3d}->{len(segment.translated_text):3d}] "
-            f"{segment.translated_text[:44]}",
+            f"[dubbing]   {unit.start:6.2f}s {mark} {unit.speaker_label:>3} "
+            f"групп={len(unit.chunks)} окно={unit.speech_budget:4.1f}с "
+            f"прогноз={predicted:4.1f}с "
+            f"слогов={uzbek_features(unit.translated_text)['syllables']:3d} "
+            f"{unit.translated_text[:40]}",
             flush=True,
         )
 
-    generated: dict[int, tuple[Path, str, str]] = {}
-    total = len(segments)
+    generated: dict[tuple[int, int], tuple[Path, str, str]] = {}
+    errors: dict[tuple[int, int], str] = {}
+    retry: list[tuple[DubSegment, int, DubChunk]] = []
+    total = len(tasks)
     done = 0
     workers = max(1, min(TTS_CONCURRENCY, total))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tts") as pool:
         futures = {
             pool.submit(
-                _generate_segment,
+                _generate_chunk,
                 client,
-                segment,
-                budgets[segment.index],
+                unit,
+                chunk,
+                position,
                 voice_map,
                 scene,
                 segments_dir,
                 speech_speed,
-            ): segment
-            for segment in segments
+            ): (unit, position, chunk)
+            for unit, position, chunk in tasks
         }
-        retry: list[DubSegment] = []
-        errors: dict[int, str] = {}
         for future in as_completed(futures):
-            segment = futures[future]
+            unit, position, chunk = futures[future]
             try:
-                generated[segment.index] = future.result()
+                generated[(unit.index, position)] = future.result()
             except Exception as exc:
-                retry.append(segment)
-                errors[segment.index] = str(exc)
+                retry.append((unit, position, chunk))
+                errors[(unit.index, position)] = str(exc)
             done += 1
-            progress(45 + round(done / total * 40), f"Озвучено {done} из {total} реплик")
+            progress(45 + round(done / total * 40), f"Озвучено {done} из {total} фраз")
 
-    # Второй заход по упавшим репликам — последовательно и без спешки.
+    # Второй заход по упавшим группам — последовательно и без спешки.
     # Чаще всего это временный сбой Gemini или лимит при параллельных запросах.
     if retry:
-        for position, segment in enumerate(sorted(retry, key=lambda s: s.start), start=1):
-            progress(
-                86,
-                f"Повторная озвучка пропущенных реплик {position} из {len(retry)}",
-            )
+        for number, (unit, position, chunk) in enumerate(
+            sorted(retry, key=lambda item: item[2].onset), start=1
+        ):
+            progress(86, f"Повторная озвучка пропущенных фраз {number} из {len(retry)}")
             time.sleep(1.0)
             try:
-                generated[segment.index] = _generate_segment(
-                    client,
-                    segment,
-                    budgets[segment.index],
-                    voice_map,
-                    scene,
-                    segments_dir,
-                    speech_speed,
+                generated[(unit.index, position)] = _generate_chunk(
+                    client, unit, chunk, position, voice_map, scene, segments_dir, speech_speed
                 )
-                errors.pop(segment.index, None)
+                errors.pop((unit.index, position), None)
             except Exception as exc:
-                errors[segment.index] = str(exc)
+                errors[(unit.index, position)] = str(exc)
 
     if not generated:
         first = "; ".join(list(errors.values())[:3])
@@ -1415,29 +2489,32 @@ def render_timeline(
 
     if errors:
         report = "\n".join(
-            f"реплика {index + 1}: {message}" for index, message in sorted(errors.items())
+            f"реплика {index + 1}, часть {position + 1}: {message}"
+            for (index, position), message in sorted(errors.items())
         )
         (work_dir / "skipped.txt").write_text(report, encoding="utf-8")
-        print(f"[dubbing] пропущено реплик: {len(errors)}\n{report}", flush=True)
-    skipped_count = len(errors)
+        print(f"[dubbing] пропущено фраз: {len(errors)}\n{report}", flush=True)
+    skipped_count = len({index for index, _ in errors})
 
-    # Раскладка без наложений: реплика никогда не начинается, пока звучит
-    # предыдущая. Иначе мужской голос «перебивает» женский, говоря одновременно.
     previous_end = 0.0
     previous_source_end: float | None = None
-    for segment in ordered:
-        if segment.index not in generated:
+    stretched = 0
+    for unit, position, chunk in sorted(tasks, key=lambda item: item[2].onset):
+        key = (unit.index, position)
+        if key not in generated:
             continue
-        fitted, spoken_text, voice = generated[segment.index]
+        fitted, spoken_text, voice = generated[key]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-        placement = max(0.0, segment.start + ONSET_OFFSET)
+        # Старт — строго лексическое начало этой группы: раньше первого слова
+        # озвучка не вступает даже ради того, чтобы уместить текст.
+        placement = max(0.0, chunk.onset + ONSET_OFFSET)
 
-        # Если в оригинале НЕ перебивают, а узбекская реплика предыдущего ещё
-        # звучит — слегка сдвигаем ответ, чтобы не «резать» человека на полуслове.
+        # Если в оригинале НЕ перебивают, а предыдущая узбекская фраза ещё
+        # звучит — слегка сдвигаем, чтобы не «резать» её на полуслове.
         interrupts_in_source = (
             previous_source_end is not None
-            and segment.start < previous_source_end - SOURCE_OVERLAP_EPS
+            and chunk.onset < previous_source_end - SOURCE_OVERLAP_EPS
         )
         if not interrupts_in_source and placement < previous_end:
             placement = min(previous_end + 0.05, placement + MAX_POLITE_SHIFT)
@@ -1445,27 +2522,56 @@ def render_timeline(
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
-            position = start_sample + index
-            existing = timeline[position]
+            sample_position = start_sample + index
+            existing = timeline[sample_position]
             # При настоящем перебивании приглушаем того, кого перебивают, вместо
             # того чтобы обрывать его — так стык звучит естественно.
             if existing and clip[index]:
                 existing = int(existing * OVERLAP_DUCK)
             mixed = existing + clip[index]
-            timeline[position] = max(-32768, min(32767, mixed))
+            timeline[sample_position] = max(-32768, min(32767, mixed))
         previous_end = max(previous_end, placement + clip_seconds)
-        previous_source_end = segment.end
+        previous_source_end = chunk.end
+        if chunk.ratio > MAX_SPEED_UP_RATIO + 0.01:
+            stretched += 1
         transcript.append(
             {
                 "start": round(placement, 3),
                 "end": round(placement + clip_seconds, 3),
-                "source": segment.source_text,
+                "source_start": round(chunk.start, 3),
+                "onset_shift": round(placement - chunk.start, 3),
+                "source": chunk.source_text,
                 "uzbek": spoken_text,
-                "speaker": segment.speaker,
+                "speaker": unit.speaker,
+                "speaker_label": unit.speaker_label,
                 "voice": voice,
-                "style": segment.style,
+                "style": unit.style,
+                "part": position + 1,
+                "parts": len(unit.chunks),
+                "predicted": round(predict_speech_duration(spoken_text, voice), 3),
+                "generated": round(chunk.generated, 3),
+                "budget": round(chunk.budget, 3),
+                "tempo": round(chunk.ratio, 3),
+                "overlap": round(unit.overlap, 2),
             }
         )
+
+    ratios = [chunk.ratio for _, _, chunk in tasks if chunk.ratio]
+    shifts = sorted(abs(float(item["onset_shift"])) for item in transcript)
+    if ratios:
+        print(
+            "[dubbing] темп: медиана "
+            f"{_median(ratios):.3f}, за рабочим диапазоном {stretched} из {len(ratios)}",
+            flush=True,
+        )
+    if shifts:
+        # Диагностика синхрона: насколько озвучка сдвинута от начала слова.
+        print(
+            f"[dubbing] сдвиг старта: медиана {_median(shifts) * 1000:.0f} мс, "
+            f"P90 {shifts[int(len(shifts) * 0.9)] * 1000:.0f} мс",
+            flush=True,
+        )
+    write_qa_report(ordered, transcript, work_dir / "qa.txt")
 
     output = work_dir / "dubbed.wav"
     final_samples = timeline[: int(duration * sample_rate)]
@@ -1483,6 +2589,38 @@ def render_timeline(
     if skipped_count:
         (work_dir / "skipped_count.txt").write_text(str(skipped_count), encoding="utf-8")
     return output
+
+
+def write_qa_report(
+    units: list[DubSegment], transcript: list[dict[str, Any]], output: Path
+) -> None:
+    """Список мест, которые стоит проверить руками, вместо тихой «уверенности».
+
+    Неуверенные и перекрывающиеся участки в дубляже всегда отправляют на
+    отдельный QA: одного голоса на cross-talk из моно-микса корректно не
+    восстановить, а сильно ускоренная реплика слышна.
+    """
+    lines: list[str] = []
+    for unit in units:
+        if unit.overlap > 0.20:
+            lines.append(
+                f"{unit.start:8.2f}s наложение голосов {unit.overlap * 100:.0f}% "
+                f"({unit.speaker_label}): {unit.source_text[:60]}"
+            )
+    for item in transcript:
+        if float(item["tempo"]) > MAX_SPEED_UP_RATIO + 0.01:
+            lines.append(
+                f"{float(item['start']):8.2f}s ускорение {float(item['tempo']):.2f}x "
+                f"— перепишите текст короче: {str(item['uzbek'])[:60]}"
+            )
+        elif abs(float(item["onset_shift"])) > 0.25:
+            lines.append(
+                f"{float(item['start']):8.2f}s старт сдвинут на "
+                f"{float(item['onset_shift']) * 1000:.0f} мс: {str(item['uzbek'])[:60]}"
+            )
+    if not lines:
+        lines.append("Замечаний нет: наложений, переускорений и сдвигов старта не найдено.")
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _srt_time(value: float) -> str:
@@ -1605,77 +2743,77 @@ def auto_dubbing_pipeline(
     source_audio = work_dir / "source.wav"
     progress(12, "Извлекается аудио")
     extract_audio(input_path, source_audio)
-    progress(24, "Распознаётся речь")
-    source_segments = transcribe(source_audio, language)
+
+    # Уровень 1: слова. Сначала ASR, затем forced alignment — из выровненных слов
+    # берутся и лексическое начало, и карта внутренних паузаций.
+    progress(20, "Распознаётся речь")
+    words, detected_language = transcribe(source_audio, language)
+    progress(26, "Выравниваются слова по аудио")
+    words = forced_align(source_audio, words, language or detected_language)
+    utterances = utterances_for_diarization(words)
 
     client = GeminiClient()
     try:
-        progress(32, "Анализируется сцена и характеры")
-        scene = client.analyze_scene(source_segments)
-        preset = STYLE_PRESETS.get(style_preset, "")
-        if preset:
-            scene = f"{preset}\n{scene}".strip()
-        progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
-        translated = client.translate(source_segments, scene)
-        progress(42, "Определяются говорящие и их голоса")
-        # 1) Диаризация: Gemini слушает аудио и размечает, кто говорит в каждой реплике.
-        turns, speaker_genders = client.identify_speakers(source_audio, source_segments)
+        # Уровень 2: кто говорит. По ВСЕМУ аудио, без искусственных лимитов длины.
+        progress(30, "Определяются говорящие")
+        diarization = diarize(client, source_audio, duration, utterances)
+        assign_word_speakers(words, diarization)
+
+        # Регистр голоса (низкий/высокий) — один раз на говорящего, по агрегату F0.
         pitch_audio = work_dir / "pitch.wav"
         try:
             make_pitch_audio(input_path, pitch_audio)
         except RuntimeError:
             pitch_audio = source_audio
-
-        genders: dict[int, str] = {}
-        source_label = "диаризация + питч"
-        if turns:
-            # 2) Объективная проверка: высота голоса каждого говорящего.
-            medians = speaker_pitches(pitch_audio, source_segments, turns)
-            speaker_genders = verify_genders_by_pitch(speaker_genders, medians)
-            for index, label in turns.items():
-                gender = speaker_genders.get(label)
-                if gender:
-                    genders[index] = gender
-            print(
-                "[dubbing] говорящие: "
-                + ", ".join(
-                    f"{label}={speaker_genders.get(label, '?')}"
-                    f" ({medians.get(label, 0):.0f} Гц)"
-                    for label in sorted(set(turns.values()))
-                ),
-                flush=True,
-            )
-        if not genders:
-            source_label = "только питч"
-            try:
-                genders = detect_speaker_genders(pitch_audio, source_segments)
-            except RuntimeError:
-                genders = {}
-
-        for segment in translated:
-            detected = genders.get(segment.index)
-            if detected:
-                segment.speaker = detected
+        medians = speaker_pitches(pitch_audio, diarization)
+        registers = voice_registers(diarization, medians)
         print(
-            f"[dubbing] пол определён для {len(genders)} из "
-            f"{len(source_segments)} реплик ({source_label})",
+            f"[dubbing] диаризация ({diarization.backend}): "
+            + ", ".join(
+                f"{label}={registers.get(label, '?')} ({medians.get(label, 0):.0f} Гц)"
+                for label in diarization.speakers
+            )
+            + f"; наложений: {len(diarization.overlaps)}",
             flush=True,
         )
 
-        # 3) Уточняем реальное начало речи, чтобы дубляж не опережал артикуляцию.
-        onsets = detect_speech_onsets(source_audio, source_segments)
-        if onsets:
-            for segment in translated:
-                onset = onsets.get(segment.index)
-                if onset is not None and onset > segment.start:
-                    segment.start = min(onset, segment.end - 0.15)
-            print(f"[dubbing] уточнено начало речи для {len(onsets)} реплик", flush=True)
+        # Уровень 3 и 4: смысловые блоки внутри одного говорящего и дыхательные группы.
+        units = build_units(words, diarization)
+        for unit in units:
+            unit.speaker = registers.get(unit.speaker_label, "male")
+        progress(34, "Уточняется начало речи по словам")
+        refined = refine_onsets(source_audio, units, diarization)
+        assign_chunk_budgets(units, duration)
+        print(
+            f"[dubbing] реплик {len(units)}, групп "
+            f"{sum(len(unit.chunks) for unit in units)}, онсетов уточнено {refined}",
+            flush=True,
+        )
 
+        progress(38, "Анализируется сцена и характеры")
+        scene = client.analyze_scene(
+            [
+                {"index": unit.index, "start": unit.start, "end": unit.end,
+                 "text": unit.source_text}
+                for unit in units
+            ]
+        )
+        preset = STYLE_PRESETS.get(style_preset, "")
+        if preset:
+            scene = f"{preset}\n{scene}".strip()
+
+        progress(40, f"Переводятся {len(units)} реплик на узбекский")
+        client.translate(units, voice_map, scene)
         progress(43, "Вычитывается узбекский текст")
-        client.polish(translated)
+        client.polish(units)
+        # Подгонка длины ТЕКСТОМ — до озвучки и до любого изменения темпа.
+        condensed = client.condense_to_budget(units, voice_map)
+        if condensed:
+            print(f"[dubbing] переписано под слоговой бюджет: {condensed} реплик", flush=True)
+
         progress(45, "Создаётся узбекская озвучка")
         dubbed = render_timeline(
-            duration, translated, client, voice_map, scene, work_dir, progress, speech_speed
+            duration, units, client, voice_map, scene, work_dir, progress, speech_speed
         )
     finally:
         client.close()
