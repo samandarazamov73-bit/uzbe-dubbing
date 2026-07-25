@@ -75,6 +75,7 @@ TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
 MAX_SPEED_UP_RATIO = 1.25  # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
+TAIL_TOLERANCE = 0.45      # допустимый хвост за окном, чтобы не рубить слова
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -86,7 +87,7 @@ VOICES = [
     "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
     "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
 ]
-DEFAULT_FEMALE_VOICE = "Kore"
+DEFAULT_FEMALE_VOICE = "Aoede"  # мягче и естественнее, чем Kore
 DEFAULT_MALE_VOICE = "Charon"
 
 ProgressCallback = Callable[[int, str], None]
@@ -887,10 +888,13 @@ def normalize_and_fit(
     # Реплика стоит на своём времени, поэтому должна уложиться в своё окно
     # (до начала следующей). Сначала пробуем уложиться ускорением — умеренным,
     # чтобы не было скороговорки. Обрезаем только в крайнем случае.
-    limit = max(max_seconds, 0.3)
+    window = max(max_seconds, 0.3)
+    # Небольшой хвост за окном допустим: на слух это не перебивание, зато слова
+    # договариваются до конца. Жёстко режем только если вылезает совсем сильно.
+    hard_limit = window + TAIL_TOLERANCE
     ratio = 1.0
-    if actual > limit:
-        ratio = actual / limit
+    if actual > window:
+        ratio = actual / window
     elif actual < target_seconds * 0.92:
         ratio = actual / max(target_seconds, 0.25)
     ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), MAX_SPEED_UP_RATIO)
@@ -900,13 +904,13 @@ def normalize_and_fit(
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
-    final_length = min(actual / ratio, limit)
+    final_length = min(actual / ratio, hard_limit)
     chain.append("afade=t=in:st=0:d=0.015")
-    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.05):.3f}:d=0.05")
+    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.06):.3f}:d=0.06")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
-            "-t", f"{limit:.3f}",
+            "-t", f"{hard_limit:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -924,25 +928,31 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
-TARGET_CLIP_RMS = 4200.0  # целевая громкость каждой реплики (из 32767)
-MAX_CLIP_GAIN = 6.0
+TARGET_CLIP_RMS = 3600.0  # целевая громкость каждой реплики (из 32767)
+MAX_CLIP_GAIN = 3.5       # выше — звук перегружается и хрипит
+PEAK_CEILING = 29000.0    # запас до предела, чтобы не было клиппинга
 
 
 def normalize_clip_level(clip: array) -> array:
-    """Выравнивает громкость каждой реплики по отдельности.
+    """Выравнивает громкость реплик, но без перегрузки и хрипа.
 
-    Без этого тихие реплики (часто женские) тонут в оригинальном звуке —
-    общая нормализация дорожки такую разницу не лечит.
+    Раньше тихие реплики (часто женские) усиливались слишком сильно и звучали
+    искажённо. Теперь усиление ограничено и дополнительно проверяется по пику.
     """
     if not clip:
         return clip
     energy = 0.0
+    peak = 1.0
     for value in clip:
-        energy += float(value) * float(value)
+        sample = float(value)
+        energy += sample * sample
+        if abs(sample) > peak:
+            peak = abs(sample)
     rms = (energy / len(clip)) ** 0.5
     if rms < 1.0:
         return clip
-    gain = min(TARGET_CLIP_RMS / rms, MAX_CLIP_GAIN)
+    # Не превышаем ни целевую громкость, ни безопасный пик.
+    gain = min(TARGET_CLIP_RMS / rms, PEAK_CEILING / peak, MAX_CLIP_GAIN)
     if abs(gain - 1.0) < 0.05:
         return clip
     return array(
