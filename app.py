@@ -72,7 +72,7 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.4  # предельное ускорение реплики
+MAX_SPEED_UP_RATIO = 1.6  # предельное ускорение реплики (слова не обрезаем)
 MIN_SLOWDOWN_RATIO = 0.9  # предельное замедление (растяжение под окно оригинала)
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
@@ -317,6 +317,69 @@ class GeminiClient:
             )
         return translated
 
+    def identify_speakers(
+        self, audio: Path, segments: list[dict[str, Any]]
+    ) -> dict[int, str]:
+        """Gemini СЛУШАЕТ оригинальное аудио и определяет пол голоса в каждой реплике.
+
+        Надёжнее любого самодельного анализа частоты: модель слышит тембр так же,
+        как человек, и не путается из-за музыки, шума и обертонов.
+        """
+        try:
+            raw = audio.read_bytes()
+        except OSError:
+            return {}
+        if len(raw) > 18 * 1024 * 1024:
+            return {}  # слишком長ое аудио для одного запроса
+
+        listing = "\n".join(
+            f"id={item['index']} {item['start']:.2f}s-{item['end']:.2f}s: {item['text']}"
+            for item in segments
+        )
+        prompt = (
+            "Listen carefully to the attached audio of a dialogue. For EACH line below, "
+            "decide whether the person speaking in that exact time range has a MALE or FEMALE "
+            "voice. Judge only by the actual sound of the voice (timbre, pitch), not by the "
+            "words. Every id must appear exactly once. Return only a JSON array like "
+            '[{"id":0,"gender":"female"},{"id":1,"gender":"male"}].\n\nLINES:\n' + listing
+        )
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(raw).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generation_config": {
+                "temperature": 0.0,
+                "response_mime_type": "application/json",
+            },
+        }
+        try:
+            data = self._post(self.text_model, payload)
+            result = self._json(self._response_text(data))
+        except RuntimeError:
+            return {}
+        if isinstance(result, dict):
+            result = result.get("lines", result.get("segments", []))
+        if not isinstance(result, list):
+            return {}
+
+        genders: dict[int, str] = {}
+        for item in result:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            gender = str(item.get("gender", "")).strip().lower()
+            if gender in {"male", "female"}:
+                try:
+                    genders[int(item["id"])] = gender
+                except (TypeError, ValueError):
+                    continue
+        return genders
+
     def polish(self, segments: list[DubSegment]) -> None:
         """Второй проход: Gemini перечитывает свой узбекский текст и исправляет огрехи.
 
@@ -365,22 +428,6 @@ class GeminiClient:
                 better = fixed.get(segment.index)
                 if better:
                     segment.translated_text = better
-
-    def shorten(self, text: str, duration: float) -> str:
-        prompt = (
-            f"Слегка сократи эту узбекскую реплику, чтобы её можно было произнести НЕ спеша "
-            f"примерно за {duration:.1f} сек. Сохрани грамматику, смысл и узбекскую латиницу — "
-            "не переводи заново, только сократи формулировку. Верни только сокращённую реплику "
-            "без кавычек и пояснений:\n" + text
-        )
-        data = self._post(
-            self.text_model,
-            {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generation_config": {"temperature": 0.2},
-            },
-        )
-        return self._response_text(data).strip().strip('"')
 
     def tts(
         self,
@@ -798,12 +845,11 @@ def normalize_and_fit(
 ) -> None:
     """Подгоняет длину реплики: target — окно оригинала, max — предел до следующей."""
     actual = media_duration(source)
-    # Подгоняем длину узбекской реплики под окно оригинала (target_seconds):
-    #  - если длиннее допустимого (max_seconds до следующей реплики) — ускоряем;
-    #  - если заметно короче окна оригинала — слегка растягиваем, чтобы совпадало
-    #    с движением губ и длиной исходной фразы.
+    # ВАЖНО: реплику НИКОГДА не обрезаем — ни одно слово не должно потеряться.
+    # Если она длиннее доступного окна, только ускоряем (в разумных пределах);
+    # если сильно короче окна оригинала, слегка растягиваем для попадания в губы.
     ratio = 1.0
-    if actual > max_seconds * 1.02:
+    if actual > max_seconds:
         ratio = actual / max(max_seconds, 0.25)
     elif actual < target_seconds * 0.92:
         ratio = actual / max(target_seconds, 0.25)
@@ -812,14 +858,13 @@ def normalize_and_fit(
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
-    # Микрофейды убирают щелчки в начале/конце реплики.
-    fade_out_start = max(0.0, max_seconds - 0.04)
+    # Микрофейды убирают щелчки; выход считаем от фактической длины, не режем.
+    final_length = actual / ratio if ratio > 0 else actual
     chain.append("afade=t=in:st=0:d=0.015")
-    chain.append(f"afade=t=out:st={fade_out_start:.3f}:d=0.04")
+    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.04):.3f}:d=0.04")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
-            "-t", f"{max_seconds:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -898,37 +943,10 @@ def _generate_segment(
     fitted = segments_dir / f"{segment.index:04d}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
+    # Текст НЕ сокращаем: перевод произносится целиком, слова не выбрасываются.
     client.tts(spoken_text, voice, raw, budget, segment.style, scene)
     trim_lead_silence(raw, trimmed)
-
-    # Умная подгонка: пока реплика не влезает, просим Gemini сократить текст и
-    # озвучиваем заново. Ускорение через FFmpeg — только крайняя мера, поэтому
-    # речь не тараторит. Держим лучший (самый близкий к окну) вариант.
-    best = trimmed
-    best_overflow = media_duration(trimmed) - budget
-    attempts = 0
-    while best_overflow > budget * 0.08 and len(spoken_text) > 12 and attempts < 3:
-        attempts += 1
-        try:
-            shorter = client.shorten(spoken_text, budget)
-        except RuntimeError:
-            break
-        if not shorter or shorter == spoken_text:
-            break
-        candidate_raw = segments_dir / f"{segment.index:04d}-raw{attempts}.wav"
-        candidate = segments_dir / f"{segment.index:04d}-trim{attempts}.wav"
-        try:
-            client.tts(shorter, voice, candidate_raw, budget, segment.style, scene)
-            trim_lead_silence(candidate_raw, candidate)
-            overflow = media_duration(candidate) - budget
-        except RuntimeError:
-            break
-        if overflow < best_overflow:
-            best, best_overflow, spoken_text = candidate, overflow, shorter
-        if overflow <= budget * 0.08:
-            break
-
-    normalize_and_fit(best, fitted, segment.duration, budget)
+    normalize_and_fit(trimmed, fitted, segment.duration, budget)
     return fitted, spoken_text, voice
 
 
@@ -942,7 +960,8 @@ def render_timeline(
     progress: ProgressCallback,
 ) -> Path:
     sample_rate = 24000
-    timeline = array("h", [0]) * (int(duration * sample_rate) + sample_rate)
+    # Запас в конце: реплики больше не обрезаются и могут выходить за окно.
+    timeline = array("h", [0]) * (int(duration * sample_rate) + sample_rate * 6)
     segments_dir = work_dir / "segments"
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
@@ -1199,16 +1218,26 @@ def auto_dubbing_pipeline(
         progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments, scene)
         progress(42, "Определяются голоса говорящих")
-        pitch_audio = work_dir / "pitch.wav"
-        try:
-            make_pitch_audio(input_path, pitch_audio)
-            genders = detect_speaker_genders(pitch_audio, source_segments)
-        except RuntimeError:
-            genders = {}  # определение пола необязательно — не валим дубляж
+        # Основной способ: Gemini слушает аудио. Запасной: анализ частоты голоса.
+        genders = client.identify_speakers(source_audio, source_segments)
+        source_label = "Gemini (по звуку)"
+        if not genders:
+            source_label = "анализ частоты"
+            pitch_audio = work_dir / "pitch.wav"
+            try:
+                make_pitch_audio(input_path, pitch_audio)
+                genders = detect_speaker_genders(pitch_audio, source_segments)
+            except RuntimeError:
+                genders = {}
         for segment in translated:
             detected = genders.get(segment.index)
-            if detected:  # питч из оригинала надёжнее догадки по тексту
+            if detected:
                 segment.speaker = detected
+        print(
+            f"[dubbing] пол определён для {len(genders)} из "
+            f"{len(source_segments)} реплик ({source_label})",
+            flush=True,
+        )
 
         progress(43, "Вычитывается узбекский текст")
         client.polish(translated)
