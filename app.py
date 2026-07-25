@@ -56,10 +56,12 @@ from __future__ import annotations
 import atexit
 import base64
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -104,10 +106,17 @@ TTS_PASSES = 3              # столько заходов на реплику:
 TAIL_KEEP_SECONDS = 2.0     # хвост за пределами видео: слово должно договориться
 MAX_MISSING_SPEECH = 0.12   # больше этой доли непереозвученной речи — дубляж бракуем
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
-TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
+TAIL_TOLERANCE = 0.40      # допустимый хвост за окном, чтобы не рубить слова
 ONSET_OFFSET = 0.0         # старт по реально найденному началу речи
-MAX_POLITE_SHIFT = 0.45    # насколько сдвинуть ответ, чтобы не резать предыдущего
-OVERLAP_DUCK = 0.55        # насколько приглушить перебиваемого при нахлёсте
+# Планировщик размещения реплик (замена жадного сдвига). Значения из практики
+# губ-синка: старт в пределах ~120 мс воспринимается «в такт», сдвиг закадровой
+# реплики терпим до ~400 мс. Порог различения двух реплик как раздельных ~80 мс.
+SPEAKER_GAP_MIN = 0.15     # целевой зазор между репликами РАЗНЫХ говорящих
+SPEAKER_GAP_HARD = 0.08    # абсолютный минимум, ниже — звучит как «разом»
+SAME_SPEAKER_GAP = 0.03    # зазор между своими же дыхательными группами
+MAX_SHIFT_ONSCREEN = 0.15  # реплику «в кадре» дальше не двигаем (губы)
+MAX_SHIFT_OFFSCREEN = 0.40 # закадровую/реакцию можно сдвинуть сильнее
+OVERLAP_DUCK = 0.35        # приглушение перебиваемого при неизбежном нахлёсте (~ -9 дБ)
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -193,6 +202,7 @@ class DubSegment:
     translated_text: str = ""
     speaker: str = "female"  # регистр голоса для TTS: "female" | "male"
     speaker_label: str = ""  # кто говорит: S1, S2, ... (диаризация)
+    voice: str = ""  # конкретный TTS-голос этого персонажа
     style: str = ""  # авто-определённая эмоция/интонация реплики
     chunks: list[DubChunk] = field(default_factory=list)
     overlap: float = 0.0  # доля перекрытия с другим говорящим
@@ -1043,8 +1053,12 @@ PITCH_SPLIT_HZ = 170.0        # граница низкий/высокий ре�
 MALE_CONFIDENT_HZ = 155.0     # ниже — уверенно низкий регистр
 FEMALE_CONFIDENT_HZ = 185.0   # выше — уверенно высокий регистр
 PITCH_MIN_VOICED = 1.0        # минимум озвученного материала на говорящего, с
+GENDER_CONFIDENT_VOICED = 3.0 # уверенное решение о поле — от 3 с материала
 ANCHOR_MIN_SECONDS = 2.5      # «эталонный» участок говорящего: не короче этого
 ANCHOR_MAX_OVERLAP = 0.10     # и почти без наложения чужого голоса
+BIMODAL_SPLIT_HZ = 40.0       # две моды F0 дальше друг от друга — метка склеила двоих
+DISTINCT_MIN_F0_HZ = 15.0     # два голоса одного пола в сцене должны отличаться на столько
+VOICE_FINGERPRINTS_PATH = JOBS_DIR / "voice_fingerprints.json"
 
 
 def make_pitch_audio(video: Path, output: Path) -> None:
@@ -1160,13 +1174,57 @@ def _load_mono(audio: Path) -> tuple[array, int]:
     return samples, rate
 
 
-def speaker_pitches(audio: Path, diarization: Diarization) -> dict[str, float]:
-    """Медианный F0 КАЖДОГО ГОВОРЯЩЕГО, агрегированный по всем его репликам.
+@dataclass
+class VoiceStats:
+    """Акустический профиль голоса говорящего, агрегированный по всем репликам."""
+
+    f0: float = 0.0                 # медианный F0, взвешенный по длительности
+    voiced: float = 0.0             # секунд озвученного материала
+    per_turn: list[tuple[float, float]] = field(default_factory=list)  # (секунды, F0)
+    bimodal: bool = False           # похоже, что метка склеила двух людей
+
+
+def _weighted_median(pairs: list[tuple[float, float]]) -> float:
+    """Медиана значений с весами (вес — длительность реплики)."""
+    if not pairs:
+        return 0.0
+    ordered = sorted(pairs, key=lambda item: item[1])
+    total = sum(weight for weight, _ in ordered)
+    if total <= 0:
+        return _median([value for _, value in ordered])
+    cumulative = 0.0
+    for weight, value in ordered:
+        cumulative += weight
+        if cumulative >= total / 2:
+            return value
+    return ordered[-1][1]
+
+
+def _is_bimodal(pairs: list[tuple[float, float]]) -> bool:
+    """1-D 2-means по F0: две устойчивые моды дальше BIMODAL_SPLIT_HZ — склейка."""
+    values = [value for _, value in pairs if value > 0]
+    if len(values) < 4 or max(values) - min(values) < BIMODAL_SPLIT_HZ:
+        return False
+    low, high = min(values), max(values)
+    lows: list[float] = []
+    highs: list[float] = []
+    for _ in range(20):
+        lows = [value for value in values if abs(value - low) <= abs(value - high)]
+        highs = [value for value in values if abs(value - low) > abs(value - high)]
+        if not lows or not highs:
+            return False
+        low, high = sum(lows) / len(lows), sum(highs) / len(highs)
+    minority = min(len(lows), len(highs)) / len(values)
+    return high - low >= BIMODAL_SPLIT_HZ and minority >= 0.2
+
+
+def speaker_voice_stats(audio: Path, diarization: Diarization) -> dict[str, VoiceStats]:
+    """Профиль КАЖДОГО ГОВОРЯЩЕГО по всем его «эталонным» участкам.
 
     F0 не идентифицирует человека (высокий мужской и низкий женский голос
-    пересекаются), поэтому питч больше не участвует в определении «кто говорит».
-    Он нужен ровно для одного — выбрать низкий или высокий TTS-тембр. Считаем
-    его по «эталонным» участкам: длинным, без наложения чужого голоса.
+    пересекаются), поэтому питч не участвует в решении «кто говорит» — только в
+    выборе TTS-тембра. Решение принимается ОДИН РАЗ на говорящего голосованием,
+    взвешенным по длительности, чтобы короткая реплика не могла его перевесить.
     """
     try:
         samples, rate = _load_mono(audio)
@@ -1177,7 +1235,7 @@ def speaker_pitches(audio: Path, diarization: Diarization) -> dict[str, float]:
     for turn in diarization.turns:
         anchors.setdefault(turn.speaker, []).append(turn)
 
-    medians: dict[str, float] = {}
+    stats: dict[str, VoiceStats] = {}
     hop_seconds = 0.01
     for label, turns in anchors.items():
         clean = [
@@ -1185,57 +1243,150 @@ def speaker_pitches(audio: Path, diarization: Diarization) -> dict[str, float]:
             for turn in turns
             if turn.duration >= ANCHOR_MIN_SECONDS and turn.overlap <= ANCHOR_MAX_OVERLAP
         ]
-        # Если длинных чистых участков нет — берём самые длинные из имеющихся.
         chosen = clean or sorted(turns, key=lambda item: item.duration, reverse=True)[:6]
-        values: list[float] = []
-        for turn in sorted(chosen, key=lambda item: item.duration, reverse=True)[:8]:
+        per_turn: list[tuple[float, float]] = []
+        voiced = 0.0
+        for turn in sorted(chosen, key=lambda item: item.duration, reverse=True)[:10]:
             start = max(0, int(turn.start * rate))
             end = min(len(samples), int(turn.end * rate))
             if end - start < rate // 4:
                 continue
-            values.extend(_segment_pitch_values(samples[start:end], rate, limit=60))
-        # Решение только при достаточном объёме озвученного материала.
-        if len(values) * hop_seconds >= PITCH_MIN_VOICED:
-            medians[label] = _median(values)
-    return medians
+            values = _segment_pitch_values(samples[start:end], rate, limit=80)
+            seconds = len(values) * hop_seconds
+            if seconds <= 0:
+                continue
+            voiced += seconds
+            per_turn.append((seconds, _median(values)))
+        stats[label] = VoiceStats(
+            f0=_weighted_median(per_turn),
+            voiced=voiced,
+            per_turn=per_turn,
+            bimodal=_is_bimodal(per_turn),
+        )
+    return stats
 
 
 def voice_registers(
-    diarization: Diarization, medians: dict[str, float]
+    diarization: Diarization, stats: dict[str, VoiceStats]
 ) -> dict[str, str]:
     """Выбирает TTS-тембр (низкий/высокий) на говорящего, а не на реплику.
 
-    Это выбор голоса для озвучки, а не «определение пола человека»: в спорной
-    зоне 155-185 Гц опираемся на мнение модели, слышавшей тембр, и только затем
-    на абсолютный порог. Решение одно на весь фильм, поэтому голос персонажа
-    не «прыгает» посреди диалога и короткая реплика не может его сменить.
+    Это выбор голоса для озвучки, а не «определение пола человека». Решение
+    одно на весь фильм и принимается по агрегату всех реплик, поэтому голос
+    персонажа не «прыгает» посреди диалога, а короткая реплика не может его
+    сменить. В спорной зоне 155-185 Гц или при малом объёме материала опираемся
+    на мнение модели о тембре, слышавшей аудио.
     """
     registers: dict[str, str] = {}
     uncertain: list[str] = []
     for label in diarization.speakers:
-        pitch = medians.get(label, 0.0)
+        profile = stats.get(label)
+        pitch = profile.f0 if profile else 0.0
+        confident = bool(profile and profile.voiced >= GENDER_CONFIDENT_VOICED)
         if pitch <= 0:
             uncertain.append(label)
-        elif pitch < MALE_CONFIDENT_HZ:
+        elif confident and pitch < MALE_CONFIDENT_HZ:
             registers[label] = "male"
-        elif pitch > FEMALE_CONFIDENT_HZ:
+        elif confident and pitch > FEMALE_CONFIDENT_HZ:
             registers[label] = "female"
+        elif not confident and pitch < MALE_CONFIDENT_HZ - 10:
+            registers[label] = "male"       # даже на малом материале явно низкий
+        elif not confident and pitch > FEMALE_CONFIDENT_HZ + 10:
+            registers[label] = "female"     # и это явно высокий
         else:
-            uncertain.append(label)
+            uncertain.append(label)         # спорно — решаем ниже
 
     for label in uncertain:
         opinion = diarization.genders.get(label)
         if opinion in {"male", "female"}:
             registers[label] = opinion
             continue
-        pitch = medians.get(label, 0.0)
+        pitch = stats[label].f0 if label in stats else 0.0
         if pitch > 0:
             registers[label] = "male" if pitch < PITCH_SPLIT_HZ else "female"
             continue
-        # Ничего не известно: не выдумываем — берём регистр самого «похожего»
-        # соседа, а если и его нет, ставим низкий (он реже звучит комично).
         registers[label] = next(iter(registers.values()), "male")
     return registers
+
+
+def load_voice_fingerprints() -> dict[str, dict[str, float]]:
+    """Акустические «отпечатки» TTS-голосов (F0 и т.п.), посчитанные заранее.
+
+    Файл заполняется калибровкой: один раз генерируем эталонную фразу каждым
+    голосом и измеряем F0. Пусто — работаем на двух голосах из настроек.
+    """
+    try:
+        data = json.loads(VOICE_FINGERPRINTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(voice): value
+        for voice, value in data.items()
+        if isinstance(value, dict) and value.get("f0")
+    }
+
+
+def assign_character_voices(
+    diarization: Diarization,
+    stats: dict[str, VoiceStats],
+    registers: dict[str, str],
+    voice_map: dict[str, str],
+    fingerprints: dict[str, dict[str, float]],
+) -> dict[str, str]:
+    """Подбирает КАЖДОМУ персонажу отдельный голос из доступных.
+
+    Пол — жёсткий фильтр (кросс-гендерный подбор запрещён). Внутри пола голос
+    выбирается ближайшим по F0 к оригинальному актёру; два персонажа не
+    получают один голос, а два голоса одного пола различаются по F0 не меньше
+    DISTINCT_MIN_F0_HZ. Нет отпечатков — падаем на два голоса из настроек.
+    """
+    fallback = {
+        label: voice_map.get(registers.get(label, "male"), voice_map["female"])
+        for label in diarization.speakers
+    }
+    if not fingerprints:
+        return fallback
+
+    def voice_gender(info: dict[str, float]) -> str:
+        return "male" if float(info.get("f0", 0.0)) < PITCH_SPLIT_HZ else "female"
+
+    pool: dict[str, list[str]] = {"male": [], "female": []}
+    for voice, info in fingerprints.items():
+        pool[voice_gender(info)].append(voice)
+
+    # Крупные роли выбирают первыми — им достаётся самый похожий голос.
+    order = sorted(
+        diarization.speakers,
+        key=lambda label: stats.get(label, VoiceStats()).voiced,
+        reverse=True,
+    )
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+    for label in order:
+        gender = registers.get(label, "male")
+        candidates = [voice for voice in pool.get(gender, []) if voice not in used]
+        if not candidates:
+            assigned[label] = fallback[label]
+            continue
+        target = stats.get(label, VoiceStats()).f0 or (140.0 if gender == "male" else 210.0)
+
+        def score(voice: str, target: float = target, gender: str = gender) -> float:
+            info = fingerprints[voice]
+            distance = abs(math.log(max(info["f0"], 1.0)) - math.log(max(target, 1.0)))
+            clash = 0.0
+            for other in used:
+                other_info = fingerprints.get(other)
+                if other_info and voice_gender(other_info) == gender:
+                    if abs(other_info["f0"] - info["f0"]) < DISTINCT_MIN_F0_HZ:
+                        clash += 1.0
+            return distance + clash
+
+        best = min(candidates, key=score)
+        assigned[label] = best
+        used.add(best)
+    return assigned
 
 
 def _frame_levels(
@@ -1670,6 +1821,48 @@ def syllable_budget(seconds: float, voice: str) -> int:
     if per_syllable <= 0.01:
         per_syllable = PRIOR_COEFFS[1]
     return max(1, int((max(0.3, seconds) - coefficients[0]) / per_syllable))
+
+
+CALIBRATION_PHRASE = (
+    "Salom, bugun havo juda yaxshi. Keling, birga suhbatlashamiz va yangiliklarni "
+    "muhokama qilamiz. Menimcha, bu ajoyib fikr."
+)
+
+
+def calibrate_voice_fingerprints(client: GeminiClient, voices: list[str]) -> dict[str, dict]:
+    """Один раз измеряет F0 каждого TTS-голоса на эталонной фразе и кэширует.
+
+    Это то, что превращает подбор голоса из «муж/жен» в «ближайший по тембру к
+    актёру»: без отпечатков assign_character_voices работает на двух голосах.
+    Требует доступа к TTS, поэтому запускается отдельно (эндпоинт
+    /api/calibrate-voices), а не на каждом дубляже.
+    """
+    fingerprints: dict[str, dict] = load_voice_fingerprints()
+    with tempfile.TemporaryDirectory() as folder:
+        work = Path(folder)
+        for voice in voices:
+            raw = work / f"{voice}-raw.wav"
+            trimmed = work / f"{voice}.wav"
+            try:
+                client.tts(CALIBRATION_PHRASE, voice, raw, 8.0, "", "", "")
+                trim_edge_silence(raw, trimmed)
+                samples, rate = _load_mono(trimmed)
+            except (RuntimeError, wave.Error, OSError) as exc:
+                print(f"[calibrate] {voice}: пропущен ({exc})", flush=True)
+                continue
+            values = _segment_pitch_values(samples, rate, limit=200)
+            if len(values) < 8:
+                print(f"[calibrate] {voice}: мало озвученных кадров", flush=True)
+                continue
+            fingerprints[voice] = {"f0": round(_median(values), 1)}
+            print(f"[calibrate] {voice}: F0={fingerprints[voice]['f0']} Гц", flush=True)
+    try:
+        VOICE_FINGERPRINTS_PATH.write_text(
+            json.dumps(fingerprints, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Не удалось сохранить отпечатки голосов: {exc}") from exc
+    return fingerprints
 
 
 def _clean_words(text: str) -> str:
@@ -2335,6 +2528,66 @@ def assign_chunk_budgets(units: list[DubSegment], duration: float) -> None:
         chunk.budget = max(0.4, min(window, chunk.duration + TAIL_TOLERANCE))
 
 
+@dataclass
+class Placement:
+    """Куда встала дыхательная группа и что при этом пришлось сделать."""
+
+    key: tuple[int, int]
+    start: float
+    length: float
+    ducked: bool = False  # осталось неизбежное наложение — перебиваемого приглушаем
+
+    @property
+    def end(self) -> float:
+        return self.start + self.length
+
+
+def schedule_chunks(
+    items: list[tuple[tuple[int, int], float, float, str, float, float, bool]],
+) -> list[Placement]:
+    """Планировщик размещения реплик на таймлайне (замена жадного сдвига).
+
+    Вход по каждой группе: (key, ideal_start, length, speaker, src_start,
+    src_end, onscreen), где src_start/src_end — границы реплики в ОРИГИНАЛЕ.
+
+    Правила уступок: реплику НИКОГДА не начинаем раньше её лексического начала и
+    НИКОГДА не обрываем. Чтобы двое не звучали разом, ответ сдвигаем вправо — но
+    не дальше допуска (в кадре 0.15 с, за кадром 0.40 с). Если и сдвига не
+    хватает, наложение оставляем и приглушаем перебиваемого (ducked=True), а не
+    двигаем без предела — так избегаем и «наездов», и лавины сдвигов до конца
+    сцены. Наложение, которое БЫЛО в оригинале, сохраняется как есть.
+    """
+    ordered = sorted(items, key=lambda item: item[1])
+    placements: list[Placement] = []
+    previous_end: float | None = None
+    previous_speaker = ""
+    previous_src_end: float | None = None
+    for key, ideal, length, speaker, src_start, src_end, onscreen in ordered:
+        src_overlap = (
+            previous_src_end is not None and src_start < previous_src_end - SOURCE_OVERLAP_EPS
+        )
+        ducked = False
+        if previous_end is None or src_overlap:
+            # Первая реплика или наложение из оригинала — ставим на своё место.
+            start = ideal
+        else:
+            gap = SAME_SPEAKER_GAP if speaker == previous_speaker else SPEAKER_GAP_MIN
+            earliest = previous_end + gap
+            if earliest <= ideal:
+                start = ideal
+            else:
+                shift_cap = ideal + (MAX_SHIFT_ONSCREEN if onscreen else MAX_SHIFT_OFFSCREEN)
+                start = min(earliest, shift_cap)
+                # Даже после предельного сдвига осталось наложение — приглушаем.
+                if start + 1e-6 < previous_end + SPEAKER_GAP_HARD:
+                    ducked = True
+        placements.append(Placement(key=key, start=max(0.0, start), length=length, ducked=ducked))
+        previous_end = max(previous_end or 0.0, start + length)
+        previous_speaker = speaker
+        previous_src_end = max(previous_src_end or 0.0, src_end)
+    return placements
+
+
 def atempo_filter(ratio: float) -> str:
     factors: list[float] = []
     while ratio > 2.0:
@@ -2521,7 +2774,9 @@ def _generate_chunk(
     raw = segments_dir / f"{name}-raw.wav"
     trimmed = segments_dir / f"{name}-trim.wav"
     fitted = segments_dir / f"{name}.wav"
-    voice = voice_map.get(segment.speaker, voice_map["female"])
+    # Голос персонажа выбран один раз на говорящего (assign_character_voices);
+    # voice_map — резерв, если конкретный голос не назначен.
+    voice = segment.voice or voice_map.get(segment.speaker, voice_map["female"])
     # ВАЖНО: если у части нет своего текста, она молчит — но НЕ произносит всю
     # реплику целиком. Иначе одна и та же фраза звучала дважды подряд.
     spoken_text = chunk.text.strip()
@@ -2748,50 +3003,63 @@ def render_timeline(
             )
     skipped_count = len({index for index, _ in errors})
 
-    previous_end = 0.0
-    previous_source_end: float | None = None
-    stretched = 0
-    for unit, position, chunk in sorted(tasks, key=lambda item: item[2].onset):
+    # Планируем размещение сразу для всех озвученных групп (просмотр вперёд по
+    # всей сцене), а не жадно по одной — так реплики не «наезжают» и не
+    # накапливают лавину сдвигов.
+    clips: dict[tuple[int, int], array] = {}
+    schedule_input: list[tuple[tuple[int, int], float, float, str, float, float, bool]] = []
+    for unit, position, chunk in tasks:
         key = (unit.index, position)
         if key not in generated:
             continue
-        fitted, spoken_text, voice = generated[key]
+        fitted, _, _ = generated[key]
         clip = normalize_clip_level(read_mono_pcm(fitted))
-        clip_seconds = len(clip) / sample_rate
-        # Старт — строго лексическое начало этой группы: раньше первого слова
-        # озвучка не вступает даже ради того, чтобы уместить текст.
-        placement = max(0.0, chunk.onset + ONSET_OFFSET)
-
-        # Если в оригинале НЕ перебивают, а предыдущая узбекская фраза ещё
-        # звучит — слегка сдвигаем, чтобы не «резать» её на полуслове.
-        interrupts_in_source = (
-            previous_source_end is not None
-            and chunk.onset < previous_source_end - SOURCE_OVERLAP_EPS
+        clips[key] = clip
+        # «В кадре» считаем реплику без наложения в оригинале: там важен губ-синк,
+        # поэтому сдвиг жёстко ограничен; закадровую/реакцию двигаем свободнее.
+        onscreen = unit.overlap < 0.2
+        schedule_input.append(
+            (
+                key,
+                max(0.0, chunk.onset + ONSET_OFFSET),
+                len(clip) / sample_rate,
+                unit.speaker_label,
+                chunk.start,
+                chunk.end,
+                onscreen,
+            )
         )
-        if not interrupts_in_source and placement < previous_end:
-            placement = min(previous_end + 0.05, placement + MAX_POLITE_SHIFT)
+    placements = {item.key: item for item in schedule_chunks(schedule_input)}
 
-        start_sample = max(0, int(placement * sample_rate))
+    stretched = 0
+    ducked_count = 0
+    for unit, position, chunk in sorted(tasks, key=lambda item: item[2].onset):
+        key = (unit.index, position)
+        placement = placements.get(key)
+        if placement is None or key not in clips:
+            continue
+        _, spoken_text, voice = generated[key]
+        clip = clips[key]
+        start_sample = max(0, int(placement.start * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
             sample_position = start_sample + index
             existing = timeline[sample_position]
-            # При настоящем перебивании приглушаем того, кого перебивают, вместо
-            # того чтобы обрывать его — так стык звучит естественно.
+            # Неизбежное наложение: приглушаем того, кого перебивают, а не рубим.
             if existing and clip[index]:
                 existing = int(existing * OVERLAP_DUCK)
             mixed = existing + clip[index]
             timeline[sample_position] = max(-32768, min(32767, mixed))
-        previous_end = max(previous_end, placement + clip_seconds)
-        previous_source_end = chunk.end
+        if placement.ducked:
+            ducked_count += 1
         if chunk.ratio > MAX_SPEED_UP_RATIO + 0.01:
             stretched += 1
         transcript.append(
             {
-                "start": round(placement, 3),
-                "end": round(placement + clip_seconds, 3),
+                "start": round(placement.start, 3),
+                "end": round(placement.end, 3),
                 "source_start": round(chunk.start, 3),
-                "onset_shift": round(placement - chunk.start, 3),
+                "onset_shift": round(placement.start - chunk.onset, 3),
                 "source": chunk.source_text,
                 "uzbek": spoken_text,
                 "speaker": unit.speaker,
@@ -2805,9 +3073,17 @@ def render_timeline(
                 "budget": round(chunk.budget, 3),
                 "tempo": round(chunk.ratio, 3),
                 "overlap": round(unit.overlap, 2),
+                "ducked": placement.ducked,
             }
         )
 
+    previous_end = max((item.end for item in placements.values()), default=0.0)
+    transcript.sort(key=lambda item: item["start"])
+    if ducked_count:
+        print(
+            f"[dubbing] неизбежных наложений (с приглушением): {ducked_count}",
+            flush=True,
+        )
     ratios = [chunk.ratio for _, _, chunk in tasks if chunk.ratio]
     shifts = sorted(abs(float(item["onset_shift"])) for item in transcript)
     if ratios:
@@ -2863,6 +3139,11 @@ def write_qa_report(
                 f"({unit.speaker_label}): {unit.source_text[:60]}"
             )
     for item in transcript:
+        if item.get("ducked"):
+            lines.append(
+                f"{float(item['start']):8.2f}s неизбежное наложение (приглушено) "
+                f"{item.get('speaker_label', '')}: {str(item['uzbek'])[:55]}"
+            )
         if float(item["tempo"]) > MAX_SPEED_UP_RATIO + 0.01:
             lines.append(
                 f"{float(item['start']):8.2f}s ускорение {float(item['tempo']):.2f}x "
@@ -3021,22 +3302,37 @@ def auto_dubbing_pipeline(
             make_pitch_audio(input_path, pitch_audio)
         except RuntimeError:
             pitch_audio = source_audio
-        medians = speaker_pitches(pitch_audio, diarization)
-        registers = voice_registers(diarization, medians)
+        stats = speaker_voice_stats(pitch_audio, diarization)
+        registers = voice_registers(diarization, stats)
+        character_voices = assign_character_voices(
+            diarization, stats, registers, voice_map, load_voice_fingerprints()
+        )
         print(
             f"[dubbing] диаризация ({diarization.backend}): "
             + ", ".join(
-                f"{label}={registers.get(label, '?')} ({medians.get(label, 0):.0f} Гц)"
+                f"{label}={registers.get(label, '?')} "
+                f"({stats[label].f0 if label in stats else 0:.0f} Гц, "
+                f"{stats[label].voiced if label in stats else 0:.1f}с"
+                + (", БИМОДАЛЬНО" if label in stats and stats[label].bimodal else "")
+                + f")->{character_voices.get(label, '?')}"
                 for label in diarization.speakers
             )
             + f"; наложений: {len(diarization.overlaps)}",
             flush=True,
         )
+        bimodal = [label for label in diarization.speakers if label in stats and stats[label].bimodal]
+        if bimodal:
+            print(
+                "[dubbing] ВНИМАНИЕ: возможно, в метках "
+                f"{', '.join(bimodal)} склеены два голоса — проверьте qa.txt",
+                flush=True,
+            )
 
         # Уровень 3 и 4: смысловые блоки внутри одного говорящего и дыхательные группы.
         units = build_units(words, diarization)
         for unit in units:
             unit.speaker = registers.get(unit.speaker_label, "male")
+            unit.voice = character_voices.get(unit.speaker_label, "")
         progress(34, "Уточняется начало речи по словам")
         refined = refine_onsets(
             source_audio, units, diarization, aligned=_alignment_state["applied"]
@@ -3189,7 +3485,26 @@ def health() -> dict[str, str]:
 
 @app.get("/api/voices")
 def list_voices() -> dict[str, Any]:
-    return {"voices": VOICES, "female": DEFAULT_FEMALE_VOICE, "male": DEFAULT_MALE_VOICE}
+    fingerprints = load_voice_fingerprints()
+    return {
+        "voices": VOICES,
+        "female": DEFAULT_FEMALE_VOICE,
+        "male": DEFAULT_MALE_VOICE,
+        "calibrated": sorted(fingerprints),
+    }
+
+
+@app.post("/api/calibrate-voices")
+def calibrate_voices() -> dict[str, Any]:
+    """Замеряет F0 всех голосов и кэширует — включает подбор голоса по тембру."""
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="На сервере не задан GEMINI_API_KEY")
+    client = GeminiClient()
+    try:
+        fingerprints = calibrate_voice_fingerprints(client, VOICES)
+    finally:
+        client.close()
+    return {"calibrated": len(fingerprints), "fingerprints": fingerprints}
 
 
 @app.post("/api/jobs", status_code=202)
