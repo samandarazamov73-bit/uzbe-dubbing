@@ -72,7 +72,7 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.25  # предельное ускорение: выше — речь звучит как скороговорка
+MAX_SPEED_UP_RATIO = 1.15  # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.45      # допустимый хвост за окном, чтобы не рубить слова
@@ -251,8 +251,11 @@ class GeminiClient:
             "Для каждой целевой реплики верни поля:\n"
             "1) translated_text — ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ. Пиши так, "
             "как реально говорят люди в этой ситуации: с эмоцией, разговорными частицами и "
-            "интонацией персонажа (не сухой подстрочник, но сохраняй смысл, имена, числа). "
-            "duration_seconds — мягкая подсказка по длине.\n"
+            "интонацией персонажа (не сухой подстрочник, но сохраняй смысл, имена, числа).\n"
+            "   ЖЁСТКОЕ ТРЕБОВАНИЕ ДЛИНЫ: перевод ОБЯЗАН укладываться в max_chars символов — "
+            "это физический предел, сколько успевает произнести человек за отрезок видео. "
+            "Если дословный перевод длиннее, передай ту же мысль короче: убери вводные слова, "
+            "используй сжатые разговорные формы. Смысл сохрани, но лимит НЕ превышай.\n"
             '2) speaker — пол говорящего: "male" или "female".\n'
             "3) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
             "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
@@ -296,6 +299,8 @@ class GeminiClient:
                 {
                     "id": item["index"],
                     "duration_seconds": round(item["end"] - item["start"], 2),
+                    # Сколько символов реально успеть произнести за это время.
+                    "max_chars": max(12, int((item["end"] - item["start"]) * 14)),
                     "text": item["text"],
                 }
                 for item in segments
@@ -472,12 +477,27 @@ class GeminiClient:
         duration: float,
         style_note: str = "",
         scene: str = "",
+        speaker: str = "",
     ) -> None:
+        # Пол задаём и в конфиге, и словами в промпте: одной настройки модели
+        # оказалось недостаточно — она озвучивала все реплики одним голосом.
+        gender_line = ""
+        if speaker == "female":
+            gender_line = (
+                "You are voicing a WOMAN. Use a clearly FEMININE voice — higher pitch, "
+                "lighter and softer timbre. Never sound like a man.\n"
+            )
+        elif speaker == "male":
+            gender_line = (
+                "You are voicing a MAN. Use a clearly MASCULINE voice — lower pitch, "
+                "fuller chest timbre. Never sound like a woman.\n"
+            )
         prompt = (
             "You are a top film dubbing voice actor performing a real character in a live scene "
             "— NOT a text-to-speech reader. Perform the line after MATN in fluent, natural, "
             "conversational Uzbek as a REAL PERSON would say it in this moment.\n"
-            "Absolute rules:\n"
+            + gender_line
+            + "Absolute rules:\n"
             "- Sound fully human and alive: rich emotion, expressive intonation, natural rhythm "
             "with micro-pauses and small changes of pace. NEVER flat, monotone or robotic.\n"
             "- Fully embody the emotion and attitude in DIRECTION (e.g. flustered, defensive, "
@@ -496,13 +516,19 @@ class GeminiClient:
             prompt += f"DIRECTION: {style_note.strip()}\n"
         prompt += f"MATN:\n{text}"
 
+        # Дублируем конфигурацию голоса в snake_case и camelCase — разные версии
+        # эндпоинта принимают разные варианты, иначе голос молча игнорируется.
+        speech_config = {
+            "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
+            "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}},
+        }
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generation_config": {
                 "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
-                },
+                "responseModalities": ["AUDIO"],
+                "speech_config": speech_config,
+                "speechConfig": speech_config,
             },
         }
 
@@ -997,7 +1023,7 @@ def _generate_segment(
     voice = voice_map.get(segment.speaker, voice_map["female"])
     spoken_text = segment.translated_text
     # Текст НЕ сокращаем: перевод произносится целиком, слова не выбрасываются.
-    client.tts(spoken_text, voice, raw, budget, segment.style, scene)
+    client.tts(spoken_text, voice, raw, budget, segment.style, scene, segment.speaker)
     trim_lead_silence(raw, trimmed)
     normalize_and_fit(trimmed, fitted, segment.duration, budget, speech_speed)
     return fitted, spoken_text, voice
