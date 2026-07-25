@@ -516,19 +516,14 @@ class GeminiClient:
             prompt += f"DIRECTION: {style_note.strip()}\n"
         prompt += f"MATN:\n{text}"
 
-        # Дублируем конфигурацию голоса в snake_case и camelCase — разные версии
-        # эндпоинта принимают разные варианты, иначе голос молча игнорируется.
-        speech_config = {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
-            "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}},
-        }
+        # Только snake_case: дублирование camelCase API отклоняет (oneof-конфликт).
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generation_config": {
                 "response_modalities": ["AUDIO"],
-                "responseModalities": ["AUDIO"],
-                "speech_config": speech_config,
-                "speechConfig": speech_config,
+                "speech_config": {
+                    "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
+                },
             },
         }
 
