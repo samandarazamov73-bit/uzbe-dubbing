@@ -72,11 +72,11 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.2   # предельное ускорение: выше — речь звучит как скороговорка
+MAX_SPEED_UP_RATIO = 1.25  # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
-ONSET_OFFSET = 0.05        # крошечный запас после уточнённого начала речи
+ONSET_OFFSET = -0.5        # узбекский голос начинает говорить на 0.5 с раньше
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -894,22 +894,28 @@ def speaker_pitches(
 def verify_genders_by_pitch(
     speaker_genders: dict[str, str], medians: dict[str, float]
 ) -> dict[str, str]:
-    """Исправляет пол говорящего, если высота голоса явно противоречит выводу модели."""
-    verified = dict(speaker_genders)
-    for label, pitch in medians.items():
-        if pitch <= 0:
-            continue
-        if pitch < 145.0:
-            verified[label] = "male"
-        elif pitch > 185.0:
-            verified[label] = "female"
+    """Определяет пол говорящих ПО ВЫСОТЕ ГОЛОСА — это объективно и надёжно.
 
-    # Если у двух говорящих оказался одинаковый пол, но высота голоса заметно
-    # отличается — более низкий это мужчина, более высокий женщина.
-    if len(medians) == 2 and len(set(verified.get(k, "") for k in medians)) == 1:
-        low, high = sorted(medians, key=lambda k: medians[k])
-        if medians[high] - medians[low] > 35.0:
-            verified[low], verified[high] = "male", "female"
+    Мнение модели используется только для тех, у кого питч измерить не удалось.
+    """
+    verified = dict(speaker_genders)
+    usable = {label: pitch for label, pitch in medians.items() if pitch > 0}
+
+    # Два и более говорящих: сравниваем их между собой. Самый низкий голос —
+    # мужской, самый высокий — женский. Это устойчивее абсолютных порогов,
+    # потому что у людей разный тембр.
+    if len(usable) >= 2:
+        ordered = sorted(usable, key=lambda label: usable[label])
+        lowest, highest = ordered[0], ordered[-1]
+        if usable[highest] - usable[lowest] > 25.0:
+            middle = (usable[highest] + usable[lowest]) / 2
+            for label, pitch in usable.items():
+                verified[label] = "male" if pitch <= middle else "female"
+            return verified
+
+    # Один говорящий (или голоса почти неотличимы) — решаем по абсолютной границе.
+    for label, pitch in usable.items():
+        verified[label] = "male" if pitch < PITCH_SPLIT_HZ else "female"
     return verified
 
 
@@ -1089,8 +1095,8 @@ def normalize_and_fit(
     window = max(max_seconds, 0.3)
     # Небольшой хвост за окном допустим: на слух это не перебивание, зато слова
     # договариваются до конца. Жёстко режем только если вылезает совсем сильно.
-    # Окно уже содержит допуск на хвост, поэтому добавляем лишь малый запас.
-    hard_limit = window + 0.1
+    # НИКАКОЙ обрезки: реплика всегда договаривается до конца. Чтобы она при этом
+    # не сильно вылезала за своё окно, только умеренно ускоряем.
     ratio = 1.0
     if actual > window:
         ratio = actual / window
@@ -1103,13 +1109,12 @@ def normalize_and_fit(
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
-    final_length = min(actual / ratio, hard_limit)
+    final_length = actual / ratio
     chain.append("afade=t=in:st=0:d=0.015")
     chain.append(f"afade=t=out:st={max(0.0, final_length - 0.06):.3f}:d=0.06")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
-            "-t", f"{hard_limit:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -1246,6 +1251,12 @@ def render_timeline(
         f"[dubbing] реплик: {len(ordered)} (мужских {males}, женских {len(ordered) - males})",
         flush=True,
     )
+    for segment in ordered:
+        mark = "М" if segment.speaker == "male" else "Ж"
+        print(
+            f"[dubbing]   {segment.start:6.2f}s {mark}  {segment.source_text[:48]}",
+            flush=True,
+        )
 
     generated: dict[int, tuple[Path, str, str]] = {}
     total = len(segments)
@@ -1322,9 +1333,9 @@ def render_timeline(
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-        # Начало речи уже уточнено по энергии оригинала, поэтому ставим точно
-        # на него — только крошечный запас, чтобы не опережать артикуляцию.
-        placement = segment.start + ONSET_OFFSET
+        # Начало речи уточнено по энергии оригинала и дополнительно сдвинуто
+        # раньше на ONSET_OFFSET, чтобы дубляж не отставал от артикуляции.
+        placement = max(0.0, segment.start + ONSET_OFFSET)
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
