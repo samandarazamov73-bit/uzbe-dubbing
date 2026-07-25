@@ -652,10 +652,21 @@ class GeminiClient:
             f"id={item['index']} {item['start']:.2f}s-{item['end']:.2f}s: {item['text']}"
             for item in segments
         )
+        count_hint = ""
+        exact = os.getenv("NUM_SPEAKERS", "").strip()
+        if exact.isdigit() and int(exact) > 0:
+            count_hint = (
+                f"There are EXACTLY {exact} speakers in this audio — use exactly "
+                f"{exact} distinct labels, no more, no fewer.\n"
+            )
         prompt = (
             "Listen carefully to the attached dialogue audio and perform speaker diarization.\n"
-            "1) Assign each line below to a speaker: S1, S2, S3... The SAME person must always "
-            "get the SAME label through the whole audio. Judge by voice timbre, not by content.\n"
+            + count_hint
+            + "1) Assign each line below to a speaker: S1, S2, S3... The SAME person must always "
+            "get the SAME label through the whole audio. Judge by VOICE TIMBRE AND PITCH, not by "
+            "content. A higher, lighter voice and a lower, fuller voice are DIFFERENT speakers "
+            "even if the words seem related — do NOT merge a woman's lines into a man just "
+            "because they are in one conversation.\n"
             "2) For each speaker, state the gender of the VOICE: male or female.\n"
             "Every id must appear exactly once. Return only JSON in this exact shape:\n"
             '{"turns":[{"id":0,"speaker":"S1"},{"id":1,"speaker":"S2"}],'
