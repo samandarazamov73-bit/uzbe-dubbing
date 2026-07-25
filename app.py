@@ -837,6 +837,32 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
+TARGET_CLIP_RMS = 4200.0  # целевая громкость каждой реплики (из 32767)
+MAX_CLIP_GAIN = 6.0
+
+
+def normalize_clip_level(clip: array) -> array:
+    """Выравнивает громкость каждой реплики по отдельности.
+
+    Без этого тихие реплики (часто женские) тонут в оригинальном звуке —
+    общая нормализация дорожки такую разницу не лечит.
+    """
+    if not clip:
+        return clip
+    energy = 0.0
+    for value in clip:
+        energy += float(value) * float(value)
+    rms = (energy / len(clip)) ** 0.5
+    if rms < 1.0:
+        return clip
+    gain = min(TARGET_CLIP_RMS / rms, MAX_CLIP_GAIN)
+    if abs(gain - 1.0) < 0.05:
+        return clip
+    return array(
+        "h", [max(-32768, min(32767, int(value * gain))) for value in clip]
+    )
+
+
 def trim_lead_silence(source: Path, output: Path) -> None:
     """Убирает тишину/паузу в начале реплики, чтобы слова начинались сразу.
 
@@ -933,7 +959,15 @@ def render_timeline(
             budget = next_start - segment.start - reserve
         else:
             budget = duration - segment.start
-        budgets[segment.index] = max(0.5, budget)
+        # Короткой реплике даём минимум ~1 c: небольшое наложение на следующую
+        # фразу естественно для диалога и лучше, чем обрезанное слово.
+        budgets[segment.index] = max(1.0, budget)
+
+    males = sum(1 for s in ordered if s.speaker == "male")
+    print(
+        f"[dubbing] реплик: {len(ordered)} (мужских {males}, женских {len(ordered) - males})",
+        flush=True,
+    )
 
     generated: dict[int, tuple[Path, str, str]] = {}
     total = len(segments)
@@ -997,7 +1031,7 @@ def render_timeline(
         if segment.index not in generated:
             continue
         fitted, spoken_text, voice = generated[segment.index]
-        clip = read_mono_pcm(fitted)
+        clip = normalize_clip_level(read_mono_pcm(fitted))
         start_sample = max(0, int(segment.start * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
@@ -1059,7 +1093,7 @@ def mux_video(
     dubbed: Path,
     output: Path,
     mode: str,
-    original_volume: float = 0.5,
+    original_volume: float = 0.25,
     dub_volume: float = 1.0,
 ) -> None:
     should_mix = mode == "mix" and has_audio(video)
@@ -1082,7 +1116,8 @@ def mux_video(
                 "-filter_complex",
                 f"[1:a:0]{voice_chain},asplit=2[dub][key];"
                 f"[0:a:0]volume={original_volume:.2f}[orig];"
-                "[orig][key]sidechaincompress=threshold=0.02:ratio=12:attack=5:release=350[duck];"
+                "[orig][key]sidechaincompress="
+                "threshold=0.005:ratio=20:attack=5:release=300[duck];"
                 "[duck][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
             ]
@@ -1303,7 +1338,7 @@ async def create_job(
     male_voice: str = Form(DEFAULT_MALE_VOICE),
     audio_mode: str = Form("mix"),
     style_preset: str = Form("auto"),
-    original_volume: float = Form(0.5),
+    original_volume: float = Form(0.25),
     dub_volume: float = Form(1.0),
 ) -> dict[str, Any]:
     if not os.getenv("GEMINI_API_KEY", "").strip():
@@ -1494,8 +1529,8 @@ footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
     <label class="option"><input type="radio" name="audio_mode" value="replace"><span><strong>Полная замена</strong><small>Только узбекская речь</small></span></label>
   </fieldset>
   <div class="grid" style="margin-top:16px">
-    <div><label for="origVol">Громкость оригинала: <span id="origVolVal">50%</span></label>
-    <input type="range" id="origVol" name="original_volume" min="0" max="1.2" step="0.05" value="0.5"></div>
+    <div><label for="origVol">Громкость оригинала: <span id="origVolVal">25%</span></label>
+    <input type="range" id="origVol" name="original_volume" min="0" max="1.2" step="0.05" value="0.25"></div>
     <div><label for="dubVol">Громкость дубляжа: <span id="dubVolVal">100%</span></label>
     <input type="range" id="dubVol" name="dub_volume" min="0.4" max="1.6" step="0.05" value="1"></div>
   </div>
