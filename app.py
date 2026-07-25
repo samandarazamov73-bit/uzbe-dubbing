@@ -1056,7 +1056,7 @@ UTTERANCE_GAP = 0.5          # черновая нарезка для диари
 UTTERANCE_MAX_SECONDS = 6.0
 ONSET_SEARCH_BACK = 0.20     # насколько раньше первого слова ищем его атаку
 ONSET_SEARCH_FORWARD = 0.30  # и насколько позже, когда слова выровнены alignment
-ONSET_SEARCH_RAW = 0.90      # без alignment метки Whisper «уезжают» вперёд сильнее
+ONSET_SEARCH_RAW = 2.50      # без alignment метки Whisper «уезжают» вперёд на секунды
 NONLEXICAL_MAX = 0.50        # изолированный всплеск такой длины — вздох/смешок
 NONLEXICAL_GAP = 0.20        # если после него пауза, это была не речь
 ONSET_LEAD = 0.03            # запас перед найденной атакой согласного
@@ -1470,22 +1470,19 @@ def refine_lexical_onset(
     if search_to - search_from < 0.03:
         return word_start
 
-    floor_levels = [
-        level
-        for _, level in _frame_levels(
-            samples, rate, max(0.0, search_from - 1.0), search_from
-        )
-    ]
-    floor_levels.sort()
-    noise = floor_levels[int(len(floor_levels) * 0.2)] if floor_levels else 0.0
-
-    body = _frame_levels(samples, rate, word_start, min(upper, word_start + 0.8))
-    peak = max((level for _, level in body), default=0.0)
+    levels = _frame_levels(samples, rate, search_from, search_to)
+    if not levels:
+        return word_start
+    # Порог считаем по ВСЕМУ окну поиска, а не по кусочку у word_start: иначе,
+    # когда речь начинается на 1-2 с позже (в начале тишина), пик меряется в
+    # тишине, и начало ошибочно остаётся на месте метки Whisper.
+    window_levels = sorted(level for _, level in levels)
+    noise = window_levels[int(len(window_levels) * 0.2)]
+    peak = window_levels[-1]
     if peak < 150:
         return word_start
     threshold = max(noise * 3.5, peak * 0.12, 120.0)
 
-    levels = _frame_levels(samples, rate, search_from, search_to)
     runs = _speech_runs(levels, threshold)
     for number, (run_start, run_end) in enumerate(runs):
         following = runs[number + 1] if number + 1 < len(runs) else None
