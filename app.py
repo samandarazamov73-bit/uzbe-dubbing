@@ -1067,6 +1067,17 @@ UNIT_FLUSH_SECONDS = 3.5     # после конца предложения за
 UNIT_SPLIT_GAP = 0.6         # пауза, по которой обязательно начинаем новый unit
 TURN_MERGE_GAP = 0.7         # соседние реплики одного говорящего сливаем в turn
 SHORT_TURN_SECONDS = 1.2     # такие «одиночные» метки считаем ненадёжными
+
+# Speaker-эмбеддинги (WavLM) для переразметки «кто говорит» БЕЗ pyannote.
+#
+# Правило, которое нельзя нарушать: границы turn'ов (start/end), полученные от
+# диаризации, НЕ пересчитываются здесь никогда. Эмбеддинги решают только, какой
+# ярлык (speaker_id) достаётся уже существующему turn'у — то, что развалило
+# тайминг в прошлый раз, было перестройкой турнов с нуля из черновых utterance.
+EMBEDDING_MIN_TURN_SECONDS = 0.25   # короче — эмбеддинг ненадёжен, метку наследуем
+EMBEDDING_MIN_TURNS = 4             # меньше — кластеризовать бессмысленно
+EMBEDDING_CLUSTER_GATE = 0.15       # mean_intra - mean_inter; ниже — не доверяем разбиению
+EMBEDDING_LAYER = 6                 # средний слой WavLM лучше держит тембр, чем последний
 # Пауза >= 250 мс синхронизируется программно (её слышно и часто под жест);
 # всё, что короче, остаётся на совести пунктуации и самого TTS.
 CHUNK_PAUSE_MIN = 0.25
@@ -1313,6 +1324,27 @@ def voice_registers(
     на мнение модели о тембре, слышавшей аудио.
     """
     registers: dict[str, str] = {}
+
+    # Ровно два говорящих — самый частый и самый надёжный случай: сравниваем их
+    # F0 друг с другом, а не с абсолютным порогом. Абсолютная граница 165-180 Гц
+    # ошибается именно тогда, когда оба голоса лежат по одну её сторону (как в
+    # реальном случае: 133 и 160 Гц — оба «ниже среднего», но разница есть и
+    # относительное сравнение её ловит надёжно).
+    speakers = diarization.speakers
+    if len(speakers) == 2:
+        first, second = speakers
+        first_stats, second_stats = stats.get(first), stats.get(second)
+        if (
+            first_stats
+            and second_stats
+            and first_stats.voiced > 0
+            and second_stats.voiced > 0
+            and abs(first_stats.f0 - second_stats.f0) >= BIMODAL_SPLIT_HZ / 2
+        ):
+            if first_stats.f0 < second_stats.f0:
+                return {first: "male", second: "female"}
+            return {first: "female", second: "male"}
+
     uncertain: list[str] = []
     for label in diarization.speakers:
         profile = stats.get(label)
@@ -2353,9 +2385,165 @@ def diarize(
             turns=[SpeakerTurn(speaker="S1", start=0.0, end=max(duration, 0.1))],
             backend="single",
         )
+    if result.backend in {"gemini", "single"}:
+        # Только у резервного пути нет надёжных embeddings — здесь и чинит
+        # разметку случай «Gemini слепил девушку в мужской голос».
+        result = relabel_by_embeddings(audio, result)
     for turn in result.turns:
         turn.overlap = result.overlap_ratio(turn.start, turn.end)
     return result
+
+
+# -----------------------------------------------------------------------------
+# Переразметка speaker_id по акустическим эмбеддингам (без pyannote)
+#
+# Идея из внешнего разбора: границы turn'ов, которые уже дал Gemini,
+# НЕПРИКОСНОВЕННЫ. Меняется только ярлык говорящего у каждого существующего
+# turn'а — вектор считается один раз на весь turn (усреднение гасит шум) и
+# кластеризуется агломеративно на число говорящих, которое уже назначил Gemini.
+# Если уверенность кластеризации низкая — исходная разметка остаётся как есть.
+# -----------------------------------------------------------------------------
+
+_wavlm_model: Any = None
+_wavlm_lock = threading.Lock()
+
+
+def _load_wavlm() -> Any:
+    """Грузит WavLM через torchaudio.pipelines — без pip, без pyannote/speechbrain."""
+    global _wavlm_model
+    with _wavlm_lock:
+        if _wavlm_model is None:
+            import torchaudio  # type: ignore[import-not-found]
+
+            bundle = torchaudio.pipelines.WAVLM_BASE
+            _wavlm_model = bundle.get_model().eval()
+        return _wavlm_model
+
+
+def _turn_embedding(model: Any, waveform: Any, rate: int, start: float, end: float) -> Any:
+    import torch  # type: ignore[import-not-found]
+
+    first = max(0, int(start * rate))
+    last = min(waveform.shape[-1], int(end * rate))
+    if last - first < rate // 20:  # короче 50 мс — не на чём считать
+        return None
+    with torch.inference_mode():
+        chunk = waveform[..., first:last]
+        features, _ = model.extract_features(chunk)
+        layer_index = min(EMBEDDING_LAYER, len(features) - 1)
+        vector = features[layer_index].mean(dim=1)
+        return torch.nn.functional.normalize(vector, dim=-1).squeeze(0)
+
+
+def _cosine(a: Any, b: Any) -> float:
+    return float((a * b).sum())
+
+
+def _cluster_gate(vectors: list[Any], labels: list[int]) -> float:
+    """mean_intra - mean_inter: насколько уверенно разделились два кластера."""
+    intra: list[float] = []
+    inter: list[float] = []
+    for i in range(len(vectors)):
+        for j in range(i + 1, len(vectors)):
+            score = _cosine(vectors[i], vectors[j])
+            (intra if labels[i] == labels[j] else inter).append(score)
+    mean_intra = sum(intra) / len(intra) if intra else 0.0
+    mean_inter = sum(inter) / len(inter) if inter else 0.0
+    return mean_intra - mean_inter
+
+
+def relabel_by_embeddings(audio: Path, diarization: Diarization) -> Diarization:
+    """Переразмечает speaker_id у уже готовых turn'ов по акустическим эмбеддингам.
+
+    start/end каждого turn'а остаются ровно те же, что дал Gemini — тайминг не
+    трогается. Если torch/torchaudio недоступны, данных мало или кластеризация
+    неуверенная (gate ниже порога) — возвращает diarization без изменений.
+    """
+    speakers = diarization.speakers
+    if len(speakers) < 2 or len(diarization.turns) < EMBEDDING_MIN_TURNS:
+        return diarization
+    try:
+        import torch  # type: ignore[import-not-found]
+        from sklearn.cluster import AgglomerativeClustering  # type: ignore[import-not-found]
+    except Exception as exc:
+        print(f"[dubbing] переразметка по эмбеддингам недоступна ({exc})", flush=True)
+        return diarization
+
+    try:
+        model = _load_wavlm()
+        samples, rate = _load_mono(audio)
+    except Exception as exc:
+        print(f"[dubbing] переразметка по эмбеддингам недоступна ({exc})", flush=True)
+        return diarization
+
+    waveform = torch.tensor([list(samples)], dtype=torch.float32) / 32768.0
+    turns = sorted(diarization.turns, key=lambda item: item.start)
+
+    vectors: list[Any] = []
+    reliable: list[bool] = []
+    for turn in turns:
+        vector = None
+        try:
+            if turn.duration >= EMBEDDING_MIN_TURN_SECONDS:
+                vector = _turn_embedding(model, waveform, rate, turn.start, turn.end)
+        except Exception:
+            vector = None
+        vectors.append(vector)
+        reliable.append(vector is not None)
+
+    usable_indices = [index for index, ok in enumerate(reliable) if ok]
+    if len(usable_indices) < EMBEDDING_MIN_TURNS:
+        return diarization
+
+    matrix = torch.stack([vectors[index] for index in usable_indices]).numpy()
+    n_clusters = min(len(speakers), len(usable_indices))
+    clustering = AgglomerativeClustering(
+        n_clusters=n_clusters, metric="cosine", linkage="average"
+    ).fit(matrix)
+    labels = list(clustering.labels_)
+
+    gate = _cluster_gate([vectors[index] for index in usable_indices], labels)
+    if gate < EMBEDDING_CLUSTER_GATE:
+        print(
+            f"[dubbing] переразметка по эмбеддингам неуверенная (gate={gate:.2f}) "
+            "— оставляю разметку Gemini",
+            flush=True,
+        )
+        return diarization
+
+    # Новые ярлыки: наследуем от соседнего надёжного turn'а (гистерезис), чтобы
+    # короткие turn'ы без эмбеддинга не остались без метки.
+    cluster_of: dict[int, int] = {index: label for index, label in zip(usable_indices, labels)}
+    new_speaker: list[str] = [""] * len(turns)
+    last_cluster: int | None = None
+    for position in range(len(turns)):
+        if position in cluster_of:
+            last_cluster = cluster_of[position]
+        if last_cluster is not None:
+            new_speaker[position] = f"E{last_cluster + 1}"
+    # Turn'ы ДО первого надёжного — берут метку первого надёжного.
+    first_known = next((label for label in new_speaker if label), "")
+    for position in range(len(new_speaker)):
+        if not new_speaker[position]:
+            new_speaker[position] = first_known
+    if not first_known or len(set(new_speaker)) < 2:
+        return diarization
+
+    relabeled = [
+        SpeakerTurn(speaker=new_speaker[position], start=turn.start, end=turn.end)
+        for position, turn in enumerate(turns)
+    ]
+    print(
+        f"[dubbing] диаризация переразмечена по WavLM-эмбеддингам (gate={gate:.2f}, "
+        f"turn'ов: {len(turns)})",
+        flush=True,
+    )
+    return Diarization(
+        turns=_merge_turns([(item.start, item.end, item.speaker) for item in relabeled]),
+        overlaps=diarization.overlaps,
+        genders={},  # старые ярлыки S1/S2 больше не действуют — решаем пол заново по F0
+        backend=diarization.backend + "+embed",
+    )
 
 
 def assign_word_speakers(words: list[Word], diarization: Diarization) -> None:
