@@ -15,16 +15,7 @@ torchaudio>=2.2,<3
 faster-whisper==1.0.0
 whisperx>=3.1,<3.4
 pyannote.audio>=3.1,<4
-scikit-learn>=1.3
 # Сепарация вокала перед выравниванием — вытягивает P90 онсета на музыке:
 demucs>=4.0
 # Альтернатива whisperx для выравнивания (turnkey, романизация из коробки):
 ctc-forced-aligner
-
-# --- Облегчённый вариант БЕЗ отдельного venv (работает прямо на текущем Python,
-# torch/torchaudio уже установлены — проверено логом пользователя) ---
-# pip install scikit-learn
-# Даёт: переразметку speaker_id по WavLM-эмбеддингам (relabel_by_embeddings в
-# app.py) — чинит случай, когда Gemini-диаризация сливает голос девушки в
-# мужской. torchaudio.pipelines.WAVLM_BASE скачивается автоматически при
-# первом запуске, pyannote/whisperx для этого НЕ нужны.
