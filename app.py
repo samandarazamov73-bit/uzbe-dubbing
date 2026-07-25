@@ -652,10 +652,21 @@ class GeminiClient:
             f"id={item['index']} {item['start']:.2f}s-{item['end']:.2f}s: {item['text']}"
             for item in segments
         )
+        count_hint = ""
+        exact = os.getenv("NUM_SPEAKERS", "").strip()
+        if exact.isdigit() and int(exact) > 0:
+            count_hint = (
+                f"There are EXACTLY {exact} speakers in this audio — use exactly "
+                f"{exact} distinct labels, no more, no fewer.\n"
+            )
         prompt = (
             "Listen carefully to the attached dialogue audio and perform speaker diarization.\n"
-            "1) Assign each line below to a speaker: S1, S2, S3... The SAME person must always "
-            "get the SAME label through the whole audio. Judge by voice timbre, not by content.\n"
+            + count_hint
+            + "1) Assign each line below to a speaker: S1, S2, S3... The SAME person must always "
+            "get the SAME label through the whole audio. Judge by VOICE TIMBRE AND PITCH, not by "
+            "content. A higher, lighter voice and a lower, fuller voice are DIFFERENT speakers "
+            "even if the words seem related — do NOT merge a woman's lines into a man just "
+            "because they are in one conversation.\n"
             "2) For each speaker, state the gender of the VOICE: male or female.\n"
             "Every id must appear exactly once. Return only JSON in this exact shape:\n"
             '{"turns":[{"id":0,"speaker":"S1"},{"id":1,"speaker":"S2"}],'
@@ -2325,8 +2336,98 @@ def gemini_diarization(
     return Diarization(turns=_merge_turns(raw), genders=genders, backend="gemini")
 
 
+def _two_pitch_clusters(values: list[float]) -> tuple[float, float, float] | None:
+    """1-D 2-means по F0. Возвращает (граница, низкий центр, высокий центр)."""
+    vals = [value for value in values if value > 0]
+    if len(vals) < 4 or max(vals) - min(vals) < BIMODAL_SPLIT_HZ:
+        return None
+    low, high = min(vals), max(vals)
+    lows: list[float] = []
+    highs: list[float] = []
+    for _ in range(25):
+        lows = [value for value in vals if abs(value - low) <= abs(value - high)]
+        highs = [value for value in vals if abs(value - low) > abs(value - high)]
+        if not lows or not highs:
+            return None
+        low, high = sum(lows) / len(lows), sum(highs) / len(highs)
+    if high - low < BIMODAL_SPLIT_HZ or min(len(lows), len(highs)) / len(vals) < 0.15:
+        return None
+    return (low + high) / 2, low, high
+
+
+def reconcile_diarization_by_pitch(
+    pitch_audio: Path, utterances: list[dict[str, Any]], diarization: Diarization
+) -> Diarization:
+    """Спасает второй голос, когда Gemini «слепил» девушку и парня в одного.
+
+    Работает ТОЛЬКО в резервном режиме (без pyannote) и ТОЛЬКО когда налицо
+    явная пара мужской+женский: два кластера F0 по разные стороны регистровой
+    границы. Разнополые голоса F0 разделяет надёжно — а это и есть частый сбой
+    Gemini-диаризации. Одного говорящего того же пола не трогаем.
+    """
+    if diarization.backend not in {"gemini", "single"}:
+        return diarization  # у pyannote есть embeddings — не мешаем
+    try:
+        samples, rate = _load_mono(pitch_audio)
+    except (wave.Error, OSError, RuntimeError):
+        return diarization
+
+    per_utt: list[tuple[dict[str, Any], float]] = []
+    for item in utterances:
+        start = max(0, int(float(item["start"]) * rate))
+        end = min(len(samples), int(float(item["end"]) * rate))
+        f0 = 0.0
+        if end - start >= rate // 4:
+            values = _segment_pitch_values(samples[start:end], rate, limit=60)
+            if len(values) >= 3:
+                f0 = _median(values)
+        per_utt.append((item, f0))
+
+    split = _two_pitch_clusters([f0 for _, f0 in per_utt if f0 > 0])
+    if split is None:
+        return diarization
+    boundary, low, high = split
+    # Уверенная разнополая пара: низкий явно мужской, высокий явно женский.
+    if not (low < MALE_CONFIDENT_HZ + 10 and high > FEMALE_CONFIDENT_HZ - 15):
+        return diarization
+
+    # Вмешиваемся, только если Gemini реально «схлопнул» диалог в один голос
+    # (одному ярлыку досталось >=65% реплик). Иначе доверяем модели.
+    counts: dict[str, int] = {}
+    for item, _ in per_utt:
+        label = diarization.speaker_at(float(item["start"]), float(item["end"]))
+        counts[label] = counts.get(label, 0) + 1
+    dominant = max(counts.values()) / len(per_utt) if per_utt else 0.0
+    if len(counts) >= 2 and dominant < 0.65:
+        return diarization
+
+    raw: list[tuple[float, float, str]] = []
+    last = "S1"
+    for item, f0 in per_utt:
+        if f0 > 0:
+            last = "S1" if f0 < boundary else "S2"
+        raw.append((float(item["start"]), float(item["end"]), last))
+    voiced_split = {label for _, _, label in raw}
+    if len(voiced_split) < 2:
+        return diarization
+    print(
+        f"[dubbing] диаризация исправлена по F0: разнополая пара "
+        f"(~{low:.0f}/{high:.0f} Гц) — реплики девушки отделены от парня",
+        flush=True,
+    )
+    return Diarization(
+        turns=_merge_turns(raw),
+        genders={"S1": "male", "S2": "female"},
+        backend=diarization.backend + "+pitch",
+    )
+
+
 def diarize(
-    client: GeminiClient, audio: Path, duration: float, utterances: list[dict[str, Any]]
+    client: GeminiClient,
+    audio: Path,
+    duration: float,
+    utterances: list[dict[str, Any]],
+    pitch_audio: Path | None = None,
 ) -> Diarization:
     result = pyannote_diarization(audio)
     if result is None or not result.turns:
@@ -2337,6 +2438,8 @@ def diarize(
             turns=[SpeakerTurn(speaker="S1", start=0.0, end=max(duration, 0.1))],
             backend="single",
         )
+    if pitch_audio is not None:
+        result = reconcile_diarization_by_pitch(pitch_audio, utterances, result)
     for turn in result.turns:
         turn.overlap = result.overlap_ratio(turn.start, turn.end)
     return result
@@ -3307,17 +3410,21 @@ def auto_dubbing_pipeline(
 
     client = GeminiClient()
     try:
-        # Уровень 2: кто говорит. По ВСЕМУ аудио, без искусственных лимитов длины.
-        progress(30, "Определяются говорящие")
-        diarization = diarize(client, source_audio, duration, utterances)
-        assign_word_speakers(words, diarization)
-
-        # Регистр голоса (низкий/высокий) — один раз на говорящего, по агрегату F0.
+        # Полосовое аудио для F0 готовим заранее: оно нужно и для проверки
+        # диаризации (разнополую пару Gemini часто «слепляет» в один голос),
+        # и для выбора регистра.
         pitch_audio = work_dir / "pitch.wav"
         try:
             make_pitch_audio(input_path, pitch_audio)
         except RuntimeError:
             pitch_audio = source_audio
+
+        # Уровень 2: кто говорит. По ВСЕМУ аудио, без искусственных лимитов длины.
+        progress(30, "Определяются говорящие")
+        diarization = diarize(client, source_audio, duration, utterances, pitch_audio)
+        assign_word_speakers(words, diarization)
+
+        # Регистр голоса (низкий/высокий) — один раз на говорящего, по агрегату F0.
         stats = speaker_voice_stats(pitch_audio, diarization)
         registers = voice_registers(diarization, stats)
         character_voices = assign_character_voices(
