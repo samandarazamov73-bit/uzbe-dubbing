@@ -76,7 +76,7 @@ MAX_SPEED_UP_RATIO = 1.2   # предельное ускорение: выше �
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
-ONSET_OFFSET = 0.2         # задержка старта: Whisper помечает начало речи раньше губ
+ONSET_OFFSET = 0.05        # крошечный запас после уточнённого начала речи
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -250,13 +250,16 @@ class GeminiClient:
             "Ты режиссёр дубляжа и переводчик. Ниже SCENE BRIEF (разбор сцены) и CONTEXT — "
             "весь скрипт по порядку. Переведи ТОЛЬКО реплики с id из TARGET, играя сцену.\n"
             "Для каждой целевой реплики верни поля:\n"
-            "1) translated_text — ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ. Пиши так, "
-            "как реально говорят люди в этой ситуации: с эмоцией, разговорными частицами и "
-            "интонацией персонажа (не сухой подстрочник, но сохраняй смысл, имена, числа).\n"
-            "   ЖЁСТКОЕ ТРЕБОВАНИЕ ДЛИНЫ: перевод ОБЯЗАН укладываться в max_chars символов — "
-            "это физический предел, сколько успевает произнести человек за отрезок видео. "
-            "Если дословный перевод длиннее, передай ту же мысль короче: убери вводные слова, "
-            "используй сжатые разговорные формы. Смысл сохрани, но лимит НЕ превышай.\n"
+            "1) translated_text — ТОЧНЫЙ и ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ.\n"
+            "   ГЛАВНОЕ — ТОЧНОСТЬ СМЫСЛА: переведи именно то, что человек сказал. Ничего не "
+            "выдумывай, не добавляй и не выбрасывай смысловые части, сохраняй имена, числа, "
+            "вопрос остаётся вопросом, отрицание — отрицанием. Проверь, что узбекская фраза "
+            "означает то же самое, что и оригинал.\n"
+            "   Пиши живым разговорным языком носителя, с эмоцией и интонацией персонажа, а не "
+            "сухим подстрочником.\n"
+            "   ДЛИНА: старайся уложиться в max_chars символов (столько успевает произнести "
+            "человек за отрезок видео) — выбирай более короткие формулировки той же мысли. "
+            "Но НИКОГДА не жертвуй точностью смысла и грамматикой ради длины.\n"
             '2) speaker — пол говорящего: "male" или "female".\n'
             "3) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
             "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
@@ -329,7 +332,7 @@ class GeminiClient:
                     "id": item["index"],
                     "duration_seconds": round(item["end"] - item["start"], 2),
                     # Сколько символов реально успеть произнести за это время.
-                    "max_chars": max(12, int((item["end"] - item["start"]) * 14)),
+                    "max_chars": max(14, int((item["end"] - item["start"]) * 16)),
                     "text": item["text"],
                 }
                 for item in segments
@@ -395,29 +398,32 @@ class GeminiClient:
 
     def identify_speakers(
         self, audio: Path, segments: list[dict[str, Any]]
-    ) -> dict[int, str]:
-        """Gemini СЛУШАЕТ оригинальное аудио и определяет пол голоса в каждой реплике.
+    ) -> tuple[dict[int, str], dict[str, str]]:
+        """Диаризация: кто говорит в каждой реплике и какого пола каждый говорящий.
 
-        Надёжнее любого самодельного анализа частоты: модель слышит тембр так же,
-        как человек, и не путается из-за музыки, шума и обертонов.
+        Пол определяется ОДИН РАЗ на говорящего, а не на каждую реплику — поэтому
+        голос персонажа больше не «прыгает» с мужского на женский посреди диалога.
         """
         try:
             raw = audio.read_bytes()
         except OSError:
-            return {}
+            return {}, {}
         if len(raw) > 18 * 1024 * 1024:
-            return {}  # слишком長ое аудио для одного запроса
+            return {}, {}  # слишком длинное аудио для одного запроса
 
         listing = "\n".join(
             f"id={item['index']} {item['start']:.2f}s-{item['end']:.2f}s: {item['text']}"
             for item in segments
         )
         prompt = (
-            "Listen carefully to the attached audio of a dialogue. For EACH line below, "
-            "decide whether the person speaking in that exact time range has a MALE or FEMALE "
-            "voice. Judge only by the actual sound of the voice (timbre, pitch), not by the "
-            "words. Every id must appear exactly once. Return only a JSON array like "
-            '[{"id":0,"gender":"female"},{"id":1,"gender":"male"}].\n\nLINES:\n' + listing
+            "Listen carefully to the attached dialogue audio and perform speaker diarization.\n"
+            "1) Assign each line below to a speaker: S1, S2, S3... The SAME person must always "
+            "get the SAME label through the whole audio. Judge by voice timbre, not by content.\n"
+            "2) For each speaker, state the gender of the VOICE: male or female.\n"
+            "Every id must appear exactly once. Return only JSON in this exact shape:\n"
+            '{"turns":[{"id":0,"speaker":"S1"},{"id":1,"speaker":"S2"}],'
+            '"speakers":[{"speaker":"S1","gender":"male"},'
+            '{"speaker":"S2","gender":"female"}]}\n\nLINES:\n' + listing
         )
         payload = {
             "contents": [
@@ -438,23 +444,47 @@ class GeminiClient:
             data = self._post(self.text_model, payload)
             result = self._json(self._response_text(data))
         except RuntimeError:
-            return {}
-        if isinstance(result, dict):
-            result = result.get("lines", result.get("segments", []))
-        if not isinstance(result, list):
-            return {}
+            return {}, {}
 
-        genders: dict[int, str] = {}
-        for item in result:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            gender = str(item.get("gender", "")).strip().lower()
-            if gender in {"male", "female"}:
+        turns_raw: Any = []
+        speakers_raw: Any = []
+        if isinstance(result, dict):
+            turns_raw = result.get("turns", result.get("lines", []))
+            speakers_raw = result.get("speakers", [])
+        elif isinstance(result, list):
+            # Модель могла вернуть плоский список — разберём его как turns.
+            turns_raw = result
+
+        turns: dict[int, str] = {}
+        if isinstance(turns_raw, list):
+            for item in turns_raw:
+                if not isinstance(item, dict) or "id" not in item:
+                    continue
+                label = str(item.get("speaker", "")).strip().upper()
+                if not label:
+                    gender = str(item.get("gender", "")).strip().lower()
+                    label = gender.upper() if gender in {"male", "female"} else ""
+                if not label:
+                    continue
                 try:
-                    genders[int(item["id"])] = gender
+                    turns[int(item["id"])] = label
                 except (TypeError, ValueError):
                     continue
-        return genders
+
+        speaker_genders: dict[str, str] = {}
+        if isinstance(speakers_raw, list):
+            for item in speakers_raw:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("speaker", "")).strip().upper()
+                gender = str(item.get("gender", "")).strip().lower()
+                if label and gender in {"male", "female"}:
+                    speaker_genders[label] = gender
+        # Если модель сразу вернула пол вместо метки — используем его как метку.
+        for label in set(turns.values()):
+            if label in {"MALE", "FEMALE"} and label not in speaker_genders:
+                speaker_genders[label] = label.lower()
+        return turns, speaker_genders
 
     def polish(self, segments: list[DubSegment]) -> None:
         """Второй проход: Gemini перечитывает свой узбекский текст и исправляет огрехи.
@@ -470,10 +500,13 @@ class GeminiClient:
             ]
             prompt = (
                 "Ты редактор-носитель узбекского языка, вычитываешь текст дубляжа. Для каждой "
-                "строки сверь uzbek с source и исправь: задвоенные и лишние слова, кальки с "
-                "русского/английского, неестественные обороты, ошибки грамматики и узбекской "
-                "латиницы, неверный смысл. Сохрани примерно ту же длину и разговорный стиль — "
-                "это устная речь для озвучки. Если строка уже хороша, верни её без изменений. "
+                "строки СНАЧАЛА проверь главное: точно ли uzbek передаёт смысл source — не "
+                "потерян ли смысловой кусок, не искажён ли смысл, сохранены ли имена, числа, "
+                "вопрос/отрицание. Если смысл неверный, перепиши строку правильно. Затем "
+                "исправь задвоенные и лишние слова, кальки с русского/английского, "
+                "неестественные обороты, ошибки грамматики и узбекской латиницы. Сохрани "
+                "примерно ту же длину и разговорный стиль — это устная речь для озвучки. "
+                "Если строка уже хороша, верни её без изменений. "
                 'Верни только JSON-массив [{"id":0,"uzbek":"..."}].\n\nСТРОКИ:\n'
                 + json.dumps(payload, ensure_ascii=False)
             )
@@ -813,6 +846,114 @@ def _split_two_speakers(pitches: list[float]) -> float | None:
     if centre_high - centre_low < 40.0:
         return None  # разброс слишком мал — это один голос
     return (centre_low + centre_high) / 2
+
+
+def _load_mono(audio: Path) -> tuple[array, int]:
+    with wave.open(str(audio), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise RuntimeError("Ожидается моно 16-бит WAV")
+        rate = wav.getframerate()
+        raw = wav.readframes(wav.getnframes())
+    samples = array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples, rate
+
+
+def speaker_pitches(
+    audio: Path, segments: list[dict[str, Any]], turns: dict[int, str]
+) -> dict[str, float]:
+    """Медианный питч голоса каждого говорящего — объективная проверка пола."""
+    try:
+        samples, rate = _load_mono(audio)
+    except (wave.Error, OSError, RuntimeError):
+        return {}
+
+    per_speaker: dict[str, list[float]] = {}
+    for item in segments:
+        label = turns.get(item["index"])
+        if not label:
+            continue
+        start = max(0, int(item["start"] * rate))
+        end = min(len(samples), int(item["end"] * rate))
+        if end - start < rate // 5:
+            continue
+        pitch = _segment_pitch(samples[start:end], rate)
+        if pitch > 0:
+            per_speaker.setdefault(label, []).append(pitch)
+
+    medians: dict[str, float] = {}
+    for label, values in per_speaker.items():
+        if values:
+            values.sort()
+            medians[label] = values[len(values) // 2]
+    return medians
+
+
+def verify_genders_by_pitch(
+    speaker_genders: dict[str, str], medians: dict[str, float]
+) -> dict[str, str]:
+    """Исправляет пол говорящего, если высота голоса явно противоречит выводу модели."""
+    verified = dict(speaker_genders)
+    for label, pitch in medians.items():
+        if pitch <= 0:
+            continue
+        if pitch < 145.0:
+            verified[label] = "male"
+        elif pitch > 185.0:
+            verified[label] = "female"
+
+    # Если у двух говорящих оказался одинаковый пол, но высота голоса заметно
+    # отличается — более низкий это мужчина, более высокий женщина.
+    if len(medians) == 2 and len(set(verified.get(k, "") for k in medians)) == 1:
+        low, high = sorted(medians, key=lambda k: medians[k])
+        if medians[high] - medians[low] > 35.0:
+            verified[low], verified[high] = "male", "female"
+    return verified
+
+
+def detect_speech_onsets(
+    audio: Path, segments: list[dict[str, Any]]
+) -> dict[int, float]:
+    """Находит РЕАЛЬНОЕ начало речи в оригинале по энергии сигнала.
+
+    Распознавание часто помечает начало фразы раньше, чем человек действительно
+    заговорил, из-за чего дубляж звучал с опережением.
+    """
+    try:
+        samples, rate = _load_mono(audio)
+    except (wave.Error, OSError, RuntimeError):
+        return {}
+
+    onsets: dict[int, float] = {}
+    frame = max(1, rate // 100)  # кадр 10 мс
+    for item in segments:
+        search_from = max(0, int((item["start"] - 0.15) * rate))
+        search_to = min(len(samples), int((item["start"] + 0.7) * rate))
+        body_to = min(len(samples), int(item["end"] * rate))
+        if body_to - search_from < frame * 3:
+            continue
+
+        # Порог считаем от громкости самой реплики, а не абсолютный.
+        body = samples[search_from:body_to]
+        peak = max((abs(v) for v in body), default=0)
+        if peak < 200:
+            continue
+        threshold = peak * 0.18
+
+        position = search_from
+        found: float | None = None
+        while position + frame <= search_to:
+            chunk = samples[position : position + frame]
+            level = max(abs(v) for v in chunk)
+            if level >= threshold:
+                found = position / rate
+                break
+            position += frame
+        if found is not None:
+            onsets[item["index"]] = found
+    return onsets
 
 
 def detect_speaker_genders(audio: Path, segments: list[dict[str, Any]]) -> dict[int, str]:
@@ -1181,8 +1322,8 @@ def render_timeline(
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-        # Небольшая задержка: распознавание помечает начало речи раньше, чем
-        # человек реально открывает рот, поэтому дубляж звучал с опережением.
+        # Начало речи уже уточнено по энергии оригинала, поэтому ставим точно
+        # на него — только крошечный запас, чтобы не опережать артикуляцию.
         placement = segment.start + ONSET_OFFSET
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
@@ -1351,18 +1492,41 @@ def auto_dubbing_pipeline(
             scene = f"{preset}\n{scene}".strip()
         progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments, scene)
-        progress(42, "Определяются голоса говорящих")
-        # Основной способ: Gemini слушает аудио. Запасной: анализ частоты голоса.
-        genders = client.identify_speakers(source_audio, source_segments)
-        source_label = "Gemini (по звуку)"
+        progress(42, "Определяются говорящие и их голоса")
+        # 1) Диаризация: Gemini слушает аудио и размечает, кто говорит в каждой реплике.
+        turns, speaker_genders = client.identify_speakers(source_audio, source_segments)
+        pitch_audio = work_dir / "pitch.wav"
+        try:
+            make_pitch_audio(input_path, pitch_audio)
+        except RuntimeError:
+            pitch_audio = source_audio
+
+        genders: dict[int, str] = {}
+        source_label = "диаризация + питч"
+        if turns:
+            # 2) Объективная проверка: высота голоса каждого говорящего.
+            medians = speaker_pitches(pitch_audio, source_segments, turns)
+            speaker_genders = verify_genders_by_pitch(speaker_genders, medians)
+            for index, label in turns.items():
+                gender = speaker_genders.get(label)
+                if gender:
+                    genders[index] = gender
+            print(
+                "[dubbing] говорящие: "
+                + ", ".join(
+                    f"{label}={speaker_genders.get(label, '?')}"
+                    f" ({medians.get(label, 0):.0f} Гц)"
+                    for label in sorted(set(turns.values()))
+                ),
+                flush=True,
+            )
         if not genders:
-            source_label = "анализ частоты"
-            pitch_audio = work_dir / "pitch.wav"
+            source_label = "только питч"
             try:
-                make_pitch_audio(input_path, pitch_audio)
                 genders = detect_speaker_genders(pitch_audio, source_segments)
             except RuntimeError:
                 genders = {}
+
         for segment in translated:
             detected = genders.get(segment.index)
             if detected:
@@ -1372,6 +1536,15 @@ def auto_dubbing_pipeline(
             f"{len(source_segments)} реплик ({source_label})",
             flush=True,
         )
+
+        # 3) Уточняем реальное начало речи, чтобы дубляж не опережал артикуляцию.
+        onsets = detect_speech_onsets(source_audio, source_segments)
+        if onsets:
+            for segment in translated:
+                onset = onsets.get(segment.index)
+                if onset is not None and onset > segment.start:
+                    segment.start = min(onset, segment.end - 0.15)
+            print(f"[dubbing] уточнено начало речи для {len(onsets)} реплик", flush=True)
 
         progress(43, "Вычитывается узбекский текст")
         client.polish(translated)
