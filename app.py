@@ -861,21 +861,40 @@ class GeminiClient:
             )
         prompt += f"MATN:\n{text}"
 
-        # Только snake_case: дублирование camelCase API отклоняет (oneof-конфликт).
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generation_config": {
-                "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
+        # Голый промпт на крайний случай: иногда развёрнутый промпт даёт от
+        # Vertex «HTTP 400: invalid argument», и реплика утекает в оригинал.
+        # Минимальный запрос модель принимает почти всегда.
+        bare_prompt = f"{gender_line}Speak this Uzbek line naturally and clearly:\n{text}"
+
+        def build_payload(text_prompt: str) -> dict[str, Any]:
+            return {
+                "contents": [{"role": "user", "parts": [{"text": text_prompt}]}],
+                "generation_config": {
+                    "response_modalities": ["AUDIO"],
+                    "speech_config": {
+                        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}}
+                    },
                 },
-            },
-        }
+            }
 
         inline = None
         detail = ""
-        for attempt in range(3):
-            data = self._post(self.tts_model, payload)
+        attempts = 4
+        for attempt in range(attempts):
+            # На последней попытке — голый промпт (обходит invalid-argument).
+            payload = build_payload(bare_prompt if attempt == attempts - 1 else prompt)
+            try:
+                data = self._post(self.tts_model, payload)
+            except RuntimeError as exc:
+                # В т.ч. перемежающийся HTTP 400: не бросаем сразу, а повторяем —
+                # иначе одна реплика молча остаётся на языке оригинала.
+                detail = str(exc)
+                if attempt < attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    f"Gemini TTS не вернул аудио после {attempts} попыток. {detail}"
+                ) from exc
             candidates = data.get("candidates") or []
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
@@ -900,12 +919,12 @@ class GeminiClient:
             else:
                 detail = "пустой ответ (нет candidates)"
             inline = None
-            if attempt < 2:
+            if attempt < attempts - 1:
                 time.sleep(1.5 * (attempt + 1))
 
         if not inline or not inline.get("data"):
             raise RuntimeError(
-                "Gemini TTS не вернул аудио после 3 попыток. "
+                f"Gemini TTS не вернул аудио после {attempts} попыток. "
                 f"{detail}. Проверьте доступ к модели {self.tts_model} и лимиты; "
                 "при частых сбоях снизьте TTS_CONCURRENCY."
             )
