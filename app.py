@@ -952,23 +952,46 @@ def render_timeline(
             ): segment
             for segment in segments
         }
-        failures: list[str] = []
+        retry: list[DubSegment] = []
+        errors: dict[int, str] = {}
         for future in as_completed(futures):
             segment = futures[future]
             try:
                 generated[segment.index] = future.result()
             except Exception as exc:
-                # Сбой одной реплики не должен рушить весь дубляж — пропускаем её.
-                failures.append(f"реплика {segment.index + 1}: {exc}")
+                retry.append(segment)
+                errors[segment.index] = str(exc)
             done += 1
             progress(45 + round(done / total * 40), f"Озвучено {done} из {total} реплик")
 
+    # Второй заход по упавшим репликам — последовательно и без спешки.
+    # Чаще всего это временный сбой Gemini или лимит при параллельных запросах.
+    if retry:
+        for position, segment in enumerate(sorted(retry, key=lambda s: s.start), start=1):
+            progress(
+                86,
+                f"Повторная озвучка пропущенных реплик {position} из {len(retry)}",
+            )
+            time.sleep(1.0)
+            try:
+                generated[segment.index] = _generate_segment(
+                    client, segment, budgets[segment.index], voice_map, scene, segments_dir
+                )
+                errors.pop(segment.index, None)
+            except Exception as exc:
+                errors[segment.index] = str(exc)
+
     if not generated:
-        raise RuntimeError(
-            "Не удалось озвучить ни одну реплику. " + ("; ".join(failures[:3]) if failures else "")
+        first = "; ".join(list(errors.values())[:3])
+        raise RuntimeError(f"Не удалось озвучить ни одну реплику. {first}")
+
+    if errors:
+        report = "\n".join(
+            f"реплика {index + 1}: {message}" for index, message in sorted(errors.items())
         )
-    if failures:
-        (work_dir / "skipped.txt").write_text("\n".join(failures), encoding="utf-8")
+        (work_dir / "skipped.txt").write_text(report, encoding="utf-8")
+        print(f"[dubbing] пропущено реплик: {len(errors)}\n{report}", flush=True)
+    skipped_count = len(errors)
 
     for segment in ordered:
         if segment.index not in generated:
@@ -1005,6 +1028,8 @@ def render_timeline(
         json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     write_srt(transcript, work_dir / "uzbek.srt")
+    if skipped_count:
+        (work_dir / "skipped_count.txt").write_text(str(skipped_count), encoding="utf-8")
     return output
 
 
@@ -1113,7 +1138,8 @@ def auto_dubbing_pipeline(
     original_volume: float,
     dub_volume: float,
     progress: ProgressCallback,
-) -> None:
+) -> int:
+    """Возвращает количество реплик, которые не удалось озвучить."""
     work_dir = input_path.parent
     progress(5, "Проверяется видео")
     duration = media_duration(input_path)
@@ -1165,6 +1191,14 @@ def auto_dubbing_pipeline(
         raise RuntimeError("FFmpeg не создал итоговое видео")
     media_duration(output_path)
 
+    skipped_file = work_dir / "skipped_count.txt"
+    if skipped_file.is_file():
+        try:
+            return int(skipped_file.read_text(encoding="utf-8").strip())
+        except ValueError:
+            return 0
+    return 0
+
 
 def process_job(
     job_id: str,
@@ -1182,7 +1216,7 @@ def process_job(
         update_job(job_id, status="processing", progress=percent, message=message)
 
     try:
-        auto_dubbing_pipeline(
+        skipped = auto_dubbing_pipeline(
             input_path,
             output_path,
             language,
@@ -1193,11 +1227,15 @@ def process_job(
             dub_volume,
             progress,
         )
+        message = "Дубляж готов"
+        if skipped:
+            message = f"Дубляж готов, но {skipped} реплик(и) не удалось озвучить"
         update_job(
             job_id,
             status="completed",
             progress=100,
-            message="Дубляж готов",
+            message=message,
+            skipped=skipped,
             result_path=str(output_path),
         )
     except Exception as exc:
@@ -1215,6 +1253,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "progress": job["progress"],
         "message": job["message"],
         "error": job.get("error"),
+        "skipped": job.get("skipped", 0),
         "result_url": f"/api/jobs/{job['id']}/result" if job["status"] == "completed" else None,
     }
 
@@ -1506,6 +1545,7 @@ async function poll(id){
       submit.disabled=false;submit.textContent='Создать ещё один дубляж';progress.hidden=true;
       const url=j.result_url+'?t='+Date.now();player.src=url;download.href=url;
       srtLink.href=`/api/jobs/${id}/subtitles?t=`+Date.now();
+      if(j.skipped>0)fail(`Внимание: ${j.skipped} реплик(и) не удалось озвучить — в этих местах будет тишина. Попробуйте запустить снова или снизить TTS_CONCURRENCY.`);
       result.hidden=false;result.scrollIntoView({behavior:'smooth'});return;
     }
     if(j.status==='failed'){submit.disabled=false;submit.textContent='Попробовать снова';progress.hidden=true;fail(j.error||'Не удалось создать дубляж');return}
