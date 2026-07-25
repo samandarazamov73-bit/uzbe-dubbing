@@ -1089,6 +1089,7 @@ EMBEDDING_MIN_TURN_SECONDS = 0.25   # короче — эмбеддинг нен
 EMBEDDING_MIN_TURNS = 4             # меньше — кластеризовать бессмысленно
 EMBEDDING_CLUSTER_GATE = 0.15       # mean_intra - mean_inter; ниже — не доверяем разбиению
 EMBEDDING_LAYER = 6                 # средний слой WavLM лучше держит тембр, чем последний
+PITCH_RELABEL_MIN_TURN_SECONDS = 0.5  # короче — F0 turn'а недостаточно надёжен
 # Пауза >= 250 мс синхронизируется программно (её слышно и часто под жест);
 # всё, что короче, остаётся на совести пунктуации и самого TTS.
 CHUNK_PAUSE_MIN = 0.25
@@ -1361,12 +1362,21 @@ def voice_registers(
         profile = stats.get(label)
         pitch = profile.f0 if profile else 0.0
         confident = bool(profile and profile.voiced >= GENDER_CONFIDENT_VOICED)
+        opinion = diarization.genders.get(label)
         if pitch <= 0:
             uncertain.append(label)
         elif confident and pitch < MALE_CONFIDENT_HZ:
             registers[label] = "male"
         elif confident and pitch > FEMALE_CONFIDENT_HZ:
             registers[label] = "female"
+        elif not confident and opinion in {"male", "female"}:
+            # ВАЖНО: на малом объёме материала автокорреляционный F0 — это
+            # одно шумное число, а мнение модели — она СЛЫШАЛА тембр целиком.
+            # Раньше здесь сначала проверялся широкий абсолютный порог
+            # (MALE_CONFIDENT_HZ-10 / FEMALE_CONFIDENT_HZ+10) и он перебивал
+            # прямое мнение модели о поле — именно так девушку с невысоким
+            # голосом при малом объёме материала подряд превращали в мужчину.
+            registers[label] = opinion
         elif not confident and pitch < MALE_CONFIDENT_HZ - 10:
             registers[label] = "male"       # даже на малом материале явно низкий
         elif not confident and pitch > FEMALE_CONFIDENT_HZ + 10:
@@ -1384,6 +1394,14 @@ def voice_registers(
             registers[label] = "male" if pitch < PITCH_SPLIT_HZ else "female"
             continue
         registers[label] = next(iter(registers.values()), "male")
+
+    # Диагностика: без этого лога невозможно понять, что именно решило регистр
+    # каждого говорящего — F0, относительное сравнение или мнение модели.
+    print(
+        "[dubbing] мнение модели о поле (Gemini): "
+        + (", ".join(f"{label}={gender}" for label, gender in diarization.genders.items()) or "—"),
+        flush=True,
+    )
     return registers
 
 
