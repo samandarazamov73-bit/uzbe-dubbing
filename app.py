@@ -388,7 +388,11 @@ class GeminiClient:
         if not isinstance(result, list):
             raise RuntimeError("Gemini вернул перевод в неожиданном формате")
         for item in result:
-            if isinstance(item, dict) and item.get("translated_text") and "id" in item:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            # Пробел или пустая строка — не перевод: такие реплики уйдут на
+            # повторную попытку, а не молча превратятся в тишину.
+            if str(item.get("translated_text", "")).strip():
                 results[int(item["id"])] = item
 
     def _translate_single(self, item: dict[str, Any]) -> dict[str, Any] | None:
@@ -468,13 +472,12 @@ class GeminiClient:
             if not still_missing:
                 return
             if len(still_missing) == 1 or depth >= 4:
-                # Последняя попытка: простой перевод построчно.
+                # Последняя попытка: простой перевод построчно. Не вышло —
+                # реплика разбирается ниже вместе с остальными пропусками.
                 for item in still_missing:
                     fallback = self._translate_single(item)
                     if fallback:
                         results[item["id"]] = fallback
-                    else:
-                        raise RuntimeError(f"Gemini не перевёл реплику {item['id'] + 1}")
                 return
             middle = len(still_missing) // 2
             run(still_missing[:middle], depth + 1)
@@ -485,37 +488,39 @@ class GeminiClient:
         for offset in range(0, len(ordered), step):
             run(ordered[offset : offset + step])
 
+        failed: list[DubSegment] = []
         for unit in units:
-            payload = results.get(unit.index)
-            if not payload:
-                raise RuntimeError(f"Gemini пропустил реплику {unit.index + 1}")
-            unit.translated_text = dedupe_repeats(
-                normalize_uzbek(str(payload["translated_text"]).strip())
+            if _apply_translation(unit, results.get(unit.index)):
+                continue
+            # Пустой ответ бывает на «репликах» без слов: музыка, вздох, шум,
+            # который распознавание приняло за речь. Пробуем ещё раз простым
+            # запросом и только потом отбрасываем — падать всем дубляжом из-за
+            # одной такой строки нельзя.
+            if _apply_translation(unit, self._translate_single(payloads[unit.index])):
+                continue
+            failed.append(unit)
+
+        if failed:
+            report = "; ".join(
+                f"{unit.start:.2f}s «{unit.source_text[:40]}»" for unit in failed[:6]
             )
-            unit.short_variant = dedupe_repeats(
-                normalize_uzbek(str(payload.get("short_variant", "")).strip())
+            print(
+                f"[dubbing] без перевода осталось реплик: {len(failed)} ({report})",
+                flush=True,
             )
-            unit.style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
-            parts = payload.get("parts")
-            texts: list[str] = []
-            if isinstance(parts, list) and len(parts) == len(unit.chunks):
-                texts = [dedupe_repeats(normalize_uzbek(str(part).strip())) for part in parts]
-            if not all(texts):
-                texts = split_text_by_chunks(unit.translated_text, unit.chunks)
-            for chunk, text in zip(unit.chunks, texts):
-                chunk.text = text
-            # Модель иногда дублирует один и тот же текст в двух частях — тогда
-            # одна фраза звучала бы подряд дважды. Раскладываем сами.
-            if any(
-                following.text and following.text == previous.text
-                for previous, following in zip(unit.chunks, unit.chunks[1:])
+            total_seconds = sum(unit.duration for unit in units)
+            lost_seconds = sum(unit.duration for unit in failed)
+            kept = [unit for unit in units if unit not in failed]
+            if not kept or (
+                lost_seconds > 1.5
+                and total_seconds > 0
+                and lost_seconds / total_seconds > MAX_MISSING_SPEECH
             ):
-                for chunk, text in zip(
-                    unit.chunks, split_text_by_chunks(unit.translated_text, unit.chunks)
-                ):
-                    chunk.text = text
-            if not any(chunk.text.strip() for chunk in unit.chunks):
-                raise RuntimeError(f"Пустой перевод реплики {unit.index + 1}")
+                raise RuntimeError(
+                    f"Gemini не перевёл {len(failed)} реплик(и) — "
+                    f"{lost_seconds:.0f}с из {total_seconds:.0f}с речи. Первые: {report}"
+                )
+            units[:] = kept
 
     def condense_to_budget(self, units: list[DubSegment], voice_map: dict[str, str]) -> int:
         """Дожимает текст ДО озвучки: переписать короче лучше, чем потом ускорять.
@@ -1771,6 +1776,8 @@ def transcribe(audio: Path, language: str | None) -> tuple[list[Word], str]:
         if seg_text and segment.end > segment.start:
             words.extend(_words_from_segment(float(segment.start), float(segment.end), seg_text))
 
+    # Отбрасываем «слова» без букв: ноты, тире, звёздочки субтитров.
+    words = [word for word in words if re.search(r"[^\W\d_]", word.text, flags=re.UNICODE)]
     words.sort(key=lambda item: item.start)
     if not words:
         raise RuntimeError("В видео не найдена речь")
@@ -2162,6 +2169,52 @@ def build_chunks(words: list[Word]) -> list[DubChunk]:
     return chunks
 
 
+def has_lexical_content(text: str) -> bool:
+    """Есть ли в строке настоящие слова.
+
+    Распознавание регулярно выдаёт «реплики» без слов: музыкальные символы,
+    многоточия, отдельные знаки. Переводить и озвучивать там нечего.
+    """
+    # Достаточно одной буквы: короткие «Ha», «A?», «Yoq» — настоящая речь, и
+    # терять их нельзя. Отсекаем только то, где букв нет вовсе.
+    return bool(re.search(r"[^\W\d_]", text, flags=re.UNICODE))
+
+
+def _apply_translation(unit: DubSegment, payload: dict[str, Any] | None) -> bool:
+    """Раскладывает ответ переводчика по реплике. False — переводить нечего."""
+    if not payload:
+        return False
+    translated = dedupe_repeats(normalize_uzbek(str(payload.get("translated_text", "")).strip()))
+    if not has_lexical_content(translated):
+        return False
+    unit.translated_text = translated
+    unit.short_variant = dedupe_repeats(
+        normalize_uzbek(str(payload.get("short_variant", "")).strip())
+    )
+    unit.style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
+
+    parts = payload.get("parts")
+    texts: list[str] = []
+    if isinstance(parts, list) and len(parts) == len(unit.chunks):
+        texts = [dedupe_repeats(normalize_uzbek(str(part).strip())) for part in parts]
+    if not all(text.strip() for text in texts):
+        texts = split_text_by_chunks(translated, unit.chunks)
+    for chunk, text in zip(unit.chunks, texts):
+        chunk.text = text
+    # Модель иногда дублирует один и тот же текст в двух частях — тогда одна
+    # фраза звучала бы подряд дважды. В этом случае раскладываем сами.
+    if any(
+        following.text and following.text == previous.text
+        for previous, following in zip(unit.chunks, unit.chunks[1:])
+    ):
+        for chunk, text in zip(unit.chunks, split_text_by_chunks(translated, unit.chunks)):
+            chunk.text = text
+    if not any(chunk.text.strip() for chunk in unit.chunks):
+        # Раскладка не удалась — произносим реплику одним куском, но не молчим.
+        unit.chunks[0].text = translated
+    return True
+
+
 def split_text_by_chunks(text: str, chunks: list[DubChunk]) -> list[str]:
     """Резервная раскладка перевода по дыхательным группам.
 
@@ -2237,7 +2290,9 @@ def build_units(words: list[Word], diarization: Diarization) -> list[DubSegment]
     units: list[DubSegment] = []
     for group in groups:
         text = _clean_words(" ".join(word.text for word in group))
-        if not text:
+        # Реплики без слов (музыка, «♪», отдельные знаки, обрывки шума) в дубляж
+        # не идут: переводить там нечего, а тишина под них не нужна.
+        if not has_lexical_content(text):
             continue
         chunks = build_chunks(group)
         if not chunks:
