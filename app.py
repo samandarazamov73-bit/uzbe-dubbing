@@ -732,7 +732,9 @@ CHUNK_GAP_SECONDS = 0.6   # пауза, по которой начинаем н�
 PITCH_RATE = 8000       # частота для анализа питча (достаточно для F0)
 PITCH_MIN_HZ = 70.0
 PITCH_MAX_HZ = 400.0
-PITCH_SPLIT_HZ = 165.0  # граница мужской/женский, если говорящий один
+PITCH_SPLIT_HZ = 165.0        # граница мужской/женский в спорных случаях
+MALE_CONFIDENT_HZ = 155.0     # ниже — точно мужской голос
+FEMALE_CONFIDENT_HZ = 190.0   # выше — точно женский голос
 
 
 def make_pitch_audio(video: Path, output: Path) -> None:
@@ -901,21 +903,32 @@ def verify_genders_by_pitch(
     verified = dict(speaker_genders)
     usable = {label: pitch for label, pitch in medians.items() if pitch > 0}
 
-    # Два и более говорящих: сравниваем их между собой. Самый низкий голос —
-    # мужской, самый высокий — женский. Это устойчивее абсолютных порогов,
-    # потому что у людей разный тембр.
-    if len(usable) >= 2:
-        ordered = sorted(usable, key=lambda label: usable[label])
-        lowest, highest = ordered[0], ordered[-1]
-        if usable[highest] - usable[lowest] > 25.0:
-            middle = (usable[highest] + usable[lowest]) / 2
-            for label, pitch in usable.items():
-                verified[label] = "male" if pitch <= middle else "female"
-            return verified
-
-    # Один говорящий (или голоса почти неотличимы) — решаем по абсолютной границе.
+    # ВАЖНО: не делим говорящих «один мужчина + одна женщина» насильно.
+    # Если в видео два мужчины, оба должны остаться мужчинами.
+    ambiguous: list[str] = []
     for label, pitch in usable.items():
-        verified[label] = "male" if pitch < PITCH_SPLIT_HZ else "female"
+        if pitch < MALE_CONFIDENT_HZ:
+            verified[label] = "male"        # уверенно мужской диапазон
+        elif pitch > FEMALE_CONFIDENT_HZ:
+            verified[label] = "female"      # уверенно женский диапазон
+        else:
+            ambiguous.append(label)         # спорная зона — решаем отдельно
+
+    for label in ambiguous:
+        opinion = speaker_genders.get(label)
+        if opinion in {"male", "female"}:
+            verified[label] = opinion       # доверяем модели: она слышала тембр
+            continue
+        # Мнения модели нет: сравниваем с уверенно определёнными голосами.
+        confident_male = [
+            usable[other]
+            for other, gender in verified.items()
+            if gender == "male" and other in usable and other not in ambiguous
+        ]
+        if confident_male and usable[label] - max(confident_male) > 40.0:
+            verified[label] = "female"
+        else:
+            verified[label] = "male" if usable[label] < PITCH_SPLIT_HZ else "female"
     return verified
 
 
