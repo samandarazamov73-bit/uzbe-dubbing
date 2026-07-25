@@ -339,7 +339,7 @@ class GeminiClient:
                     # Длина оригинала — главный ориентир: узбекская фраза должна
                     # быть примерно такой же, тогда она попадает в тайминг.
                     "source_chars": len(str(item["text"])),
-                    "max_chars": max(12, int(len(str(item["text"])) * 1.15)),
+                    "max_chars": max(12, len(str(item["text"]))),
                     "text": item["text"],
                 }
                 for item in segments
@@ -548,10 +548,11 @@ class GeminiClient:
 
     def enforce_length(self, segments: list[DubSegment]) -> None:
         """Дожимает длину: перевод не должен быть заметно длиннее оригинала."""
+        # Строго: перевод не должен быть длиннее оригинала более чем на 5%.
         too_long = [
             segment
             for segment in segments
-            if len(segment.translated_text) > max(14, int(len(segment.source_text) * 1.3))
+            if len(segment.translated_text) > max(14, int(len(segment.source_text) * 1.05))
         ]
         if not too_long:
             return
@@ -563,7 +564,7 @@ class GeminiClient:
                     "id": segment.index,
                     "source": segment.source_text,
                     "uzbek": segment.translated_text,
-                    "max_chars": max(12, int(len(segment.source_text) * 1.15)),
+                    "max_chars": max(12, len(segment.source_text)),
                 }
                 for segment in batch
             ]
@@ -791,8 +792,8 @@ def whisper_model():
 
 
 SENTENCE_END = (".", "!", "?", "…")
-CHUNK_MAX_SECONDS = 6.5   # не даём фразам-якорям быть слишком длинными
-CHUNK_GAP_SECONDS = 0.6   # пауза, по которой начинаем новую фразу
+CHUNK_MAX_SECONDS = 3.2   # короткие фразы: точнее синхрон и не смешиваются говорящие
+CHUNK_GAP_SECONDS = 0.32  # пауза, по которой начинаем новую фразу
 
 
 PITCH_RATE = 8000       # частота для анализа питча (достаточно для F0)
@@ -1039,7 +1040,7 @@ def detect_speech_onsets(
         position = search_from
         found: float | None = None
         streak = 0
-        needed = 12  # 120 мс непрерывной речи — вздох/смешок столько не держится
+        needed = 25  # 250 мс непрерывной речи: смех и вздох столько не тянутся
         while position + frame <= search_to:
             chunk = samples[position : position + frame]
             level = max(abs(v) for v in chunk)
