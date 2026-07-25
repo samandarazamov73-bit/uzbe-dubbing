@@ -99,6 +99,10 @@ MAX_SPEED_UP_RATIO = 1.15   # рабочий предел ускорения (в
 MIN_SLOWDOWN_RATIO = 0.92   # рабочий предел замедления
 EMERGENCY_SPEED_UP = 1.25   # аварийный режим: только для коротких реплик (<2.5 с)
 REGENERATE_OVERFLOW = 1.15  # перегенерируем реплику, если вылезла больше чем на 15%
+LOOP_DURATION_FACTOR = 1.8  # длиннее прогноза в 1.8 раза — TTS «зациклился», переозвучиваем
+TTS_PASSES = 3              # столько заходов на реплику: тишина в дубляже недопустима
+TAIL_KEEP_SECONDS = 2.0     # хвост за пределами видео: слово должно договориться
+MAX_MISSING_SPEECH = 0.12   # больше этой доли непереозвученной речи — дубляж бракуем
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
 ONSET_OFFSET = 0.0         # старт по реально найденному началу речи
@@ -485,17 +489,33 @@ class GeminiClient:
             payload = results.get(unit.index)
             if not payload:
                 raise RuntimeError(f"Gemini пропустил реплику {unit.index + 1}")
-            unit.translated_text = normalize_uzbek(str(payload["translated_text"]).strip())
-            unit.short_variant = normalize_uzbek(str(payload.get("short_variant", "")).strip())
+            unit.translated_text = dedupe_repeats(
+                normalize_uzbek(str(payload["translated_text"]).strip())
+            )
+            unit.short_variant = dedupe_repeats(
+                normalize_uzbek(str(payload.get("short_variant", "")).strip())
+            )
             unit.style = str(payload.get("style", "")).strip()[:MAX_STYLE_LEN]
             parts = payload.get("parts")
             texts: list[str] = []
             if isinstance(parts, list) and len(parts) == len(unit.chunks):
-                texts = [normalize_uzbek(str(part).strip()) for part in parts]
+                texts = [dedupe_repeats(normalize_uzbek(str(part).strip())) for part in parts]
             if not all(texts):
                 texts = split_text_by_chunks(unit.translated_text, unit.chunks)
             for chunk, text in zip(unit.chunks, texts):
                 chunk.text = text
+            # Модель иногда дублирует один и тот же текст в двух частях — тогда
+            # одна фраза звучала бы подряд дважды. Раскладываем сами.
+            if any(
+                following.text and following.text == previous.text
+                for previous, following in zip(unit.chunks, unit.chunks[1:])
+            ):
+                for chunk, text in zip(
+                    unit.chunks, split_text_by_chunks(unit.translated_text, unit.chunks)
+                ):
+                    chunk.text = text
+            if not any(chunk.text.strip() for chunk in unit.chunks):
+                raise RuntimeError(f"Пустой перевод реплики {unit.index + 1}")
 
     def condense_to_budget(self, units: list[DubSegment], voice_map: dict[str, str]) -> int:
         """Дожимает текст ДО озвучки: переписать короче лучше, чем потом ускорять.
@@ -559,7 +579,7 @@ class GeminiClient:
             if not isinstance(result, list):
                 continue
             shortened = {
-                int(item["id"]): normalize_uzbek(str(item["uzbek"]).strip())
+                int(item["id"]): dedupe_repeats(normalize_uzbek(str(item["uzbek"]).strip()))
                 for item in result
                 if isinstance(item, dict) and item.get("uzbek") and "id" in item
             }
@@ -737,7 +757,7 @@ class GeminiClient:
             for number, (segment, _, chunk) in enumerate(batch, start=offset):
                 better = fixed.get(number)
                 if better:
-                    chunk.text = normalize_uzbek(better)
+                    chunk.text = dedupe_repeats(normalize_uzbek(better))
                     segment.translated_text = _clean_words(
                         " ".join(part.text for part in segment.chunks if part.text)
                     )
@@ -1004,7 +1024,10 @@ CHUNK_MAX_SECONDS = 8.0      # предел дыхательной группы 
 UTTERANCE_GAP = 0.5          # черновая нарезка для диаризационного промпта
 UTTERANCE_MAX_SECONDS = 6.0
 ONSET_SEARCH_BACK = 0.20     # насколько раньше первого слова ищем его атаку
-ONSET_SEARCH_FORWARD = 0.30  # и насколько позже
+ONSET_SEARCH_FORWARD = 0.30  # и насколько позже, когда слова выровнены alignment
+ONSET_SEARCH_RAW = 0.90      # без alignment метки Whisper «уезжают» вперёд сильнее
+NONLEXICAL_MAX = 0.50        # изолированный всплеск такой длины — вздох/смешок
+NONLEXICAL_GAP = 0.20        # если после него пауза, это была не речь
 ONSET_LEAD = 0.03            # запас перед найденной атакой согласного
 
 
@@ -1226,8 +1249,41 @@ def _frame_levels(
     return levels
 
 
+def _speech_runs(
+    levels: list[tuple[float, float]], threshold: float
+) -> list[tuple[float, float]]:
+    """Непрерывные участки «похоже на речь» в виде (начало, конец) в секундах."""
+    runs: list[tuple[float, float]] = []
+    start: float | None = None
+    last = 0.0
+    for moment, level in levels:
+        if level >= threshold:
+            if start is None:
+                start = moment
+            last = moment + 0.01
+        elif start is not None:
+            if last - start >= 0.04:  # короче 40 мс — щелчок, не звук речи
+                runs.append((start, last))
+            start = None
+    if start is not None and last - start >= 0.04:
+        runs.append((start, last))
+
+    merged: list[tuple[float, float]] = []
+    for run_start, run_end in runs:
+        if merged and run_start - merged[-1][1] < 0.05:
+            merged[-1] = (merged[-1][0], run_end)
+        else:
+            merged.append((run_start, run_end))
+    return merged
+
+
 def refine_lexical_onset(
-    samples: array, rate: int, word_start: float, lower: float, upper: float
+    samples: array,
+    rate: int,
+    word_start: float,
+    lower: float,
+    upper: float,
+    forward: float = ONSET_SEARCH_FORWARD,
 ) -> float:
     """Уточняет начало ПЕРВОГО СЛОВА, а не «первого громкого звука».
 
@@ -1238,7 +1294,7 @@ def refine_lexical_onset(
     шумового порога, и отступаем на 30 мс назад, чтобы не срезать согласный.
     """
     search_from = max(lower, word_start - ONSET_SEARCH_BACK)
-    search_to = min(upper, word_start + ONSET_SEARCH_FORWARD)
+    search_to = min(upper, word_start + forward)
     if search_to - search_from < 0.03:
         return word_start
 
@@ -1258,24 +1314,36 @@ def refine_lexical_onset(
     threshold = max(noise * 3.5, peak * 0.12, 120.0)
 
     levels = _frame_levels(samples, rate, search_from, search_to)
-    for position, (moment, level) in enumerate(levels):
-        if level < threshold:
+    runs = _speech_runs(levels, threshold)
+    for number, (run_start, run_end) in enumerate(runs):
+        following = runs[number + 1] if number + 1 < len(runs) else None
+        if (
+            following is not None
+            and run_end - run_start <= NONLEXICAL_MAX
+            and following[0] - run_end >= NONLEXICAL_GAP
+        ):
+            # Короткий всплеск, после которого пауза — вздох, смешок или стук.
+            # Слово так не звучит, поэтому cue открываем не здесь.
             continue
-        window = [value for _, value in levels[position : position + 8]]
-        if len(window) < 4:
-            break
-        if sum(1 for value in window if value >= threshold) >= max(3, int(len(window) * 0.6)):
-            return max(lower, min(moment - ONSET_LEAD, word_start + ONSET_SEARCH_FORWARD))
+        return max(lower, min(run_start - ONSET_LEAD, search_to))
     return word_start
 
 
-def refine_onsets(audio: Path, units: list[DubSegment], diarization: Diarization) -> int:
-    """Ставит каждой дыхательной группе её лексическое начало (dub_start)."""
+def refine_onsets(
+    audio: Path, units: list[DubSegment], diarization: Diarization, aligned: bool = False
+) -> int:
+    """Ставит каждой дыхательной группе её лексическое начало (dub_start).
+
+    С forced alignment метки слов точные, поэтому окно поиска узкое. Без него
+    Whisper часто открывает реплику на секунду раньше, поэтому окно шире, а
+    изолированные всплески (вздох, смешок) пропускаются.
+    """
     try:
         samples, rate = _load_mono(audio)
     except (wave.Error, OSError, RuntimeError):
         return 0
 
+    forward = ONSET_SEARCH_FORWARD if aligned else ONSET_SEARCH_RAW
     refined = 0
     for unit in units:
         turn_start, turn_end = diarization.turn_bounds(unit.start, unit.end)
@@ -1285,7 +1353,16 @@ def refine_onsets(audio: Path, units: list[DubSegment], diarization: Diarization
             if upper <= lower:
                 chunk.onset = chunk.start
                 continue
-            onset = refine_lexical_onset(samples, rate, chunk.start, lower, upper)
+            # Внутри реплики метки надёжнее (сдвигается обычно только первое
+            # слово), поэтому широкое окно даём лишь первой группе.
+            onset = refine_lexical_onset(
+                samples,
+                rate,
+                chunk.start,
+                lower,
+                upper,
+                forward if position == 0 else ONSET_SEARCH_FORWARD,
+            )
             if abs(onset - chunk.onset) > 0.005:
                 refined += 1
             chunk.onset = max(0.0, onset)
@@ -1595,6 +1672,50 @@ def _clean_words(text: str) -> str:
     return re.sub(r"\s+([,.!?…:;])", r"\1", text)
 
 
+def dedupe_repeats(text: str) -> str:
+    """Убирает «эхо»: подряд повторённое слово или фразу.
+
+    Модель иногда выдаёт «Ajrashdingizmi? Ajrashdingizmi?» или «Amin emasman...
+    Amin emasman» — на слух это выглядит как сбой, а не как игра. Схлопываем
+    повтор фразы из 2+ слов и повтор одного длинного слова; короткие
+    выразительные удвоения («juda juda») оставляем.
+    """
+    words = text.split()
+    if len(words) < 2:
+        return text
+
+    def core(word: str) -> str:
+        return re.sub(r"[^0-9a-zʻ]", "", word.lower())
+
+    result: list[str] = []
+    position = 0
+    while position < len(words):
+        collapsed = False
+        # Сначала длинные повторы: «a b c a b c» -> «a b c».
+        for size in range(min(6, (len(words) - position) // 2), 0, -1):
+            first = [core(word) for word in words[position : position + size]]
+            second = [core(word) for word in words[position + size : position + 2 * size]]
+            if not all(first) or first != second:
+                continue
+            if size == 1 and len(first[0]) < 5:
+                continue  # короткое слово могли повторить намеренно
+            kept = list(words[position : position + size])
+            # Пунктуацию берём у ВТОРОЙ копии: она стоит на своём месте в фразе,
+            # иначе после схлопывания остаётся висящая запятая или многоточие.
+            tail = re.search(r"[^0-9A-Za-zʻ]+$", words[position + 2 * size - 1])
+            kept[-1] = re.sub(r"[^0-9A-Za-zʻ]+$", "", kept[-1]) + (
+                tail.group(0) if tail else ""
+            )
+            result.extend(kept)
+            position += 2 * size
+            collapsed = True
+            break
+        if not collapsed:
+            result.append(words[position])
+            position += 1
+    return _clean_words(" ".join(result))
+
+
 def _words_from_segment(start: float, end: float, text: str) -> list[Word]:
     """Аварийный разбор: если ASR не дал пословных меток, раскладываем слова
     по длине токенов. Хуже настоящего alignment, но структура не ломается."""
@@ -1655,6 +1776,9 @@ def transcribe(audio: Path, language: str | None) -> tuple[list[Word], str]:
         raise RuntimeError("В видео не найдена речь")
     detected = str(getattr(info, "language", "") or language or "")
     return words, detected
+
+
+_alignment_state: dict[str, bool] = {"applied": False}
 
 
 def _alignment_enabled() -> bool:
@@ -1720,6 +1844,7 @@ def forced_align(audio: Path, words: list[Word], language: str) -> list[Word]:
         return words
     result.sort(key=lambda item: item.start)
     print(f"[dubbing] forced alignment: уточнено слов {len(result)}", flush=True)
+    _alignment_state["applied"] = True
     return result
 
 
@@ -2295,9 +2420,13 @@ def trim_edge_silence(source: Path, output: Path) -> None:
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source),
+            # Хвост режем через areverse: stop_periods=-1 вырезал бы и ПАУЗЫ
+            # ВНУТРИ группы, а они часть игры и синхрона.
             "-af",
-            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.02:"
-            "stop_periods=-1:stop_threshold=-45dB:stop_silence=0.06:detection=peak",
+            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.02,"
+            "areverse,"
+            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,"
+            "areverse",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=120,
@@ -2319,8 +2448,13 @@ def _generate_chunk(
     scene: str,
     segments_dir: Path,
     speech_speed: float = 1.0,
+    simple: bool = False,
 ) -> tuple[Path, str, str]:
     """Озвучивает одну дыхательную группу с контекстом всей реплики.
+
+    `simple=True` — аварийный режим последнего захода: без сцены, ремарки и
+    контекста. Такой запрос модель почти всегда выполняет, а тишина в дубляже
+    хуже, чем менее выразительная подача.
 
     Порядок борьбы с переливом строго такой:
       1) текст уже подогнан под слоговой бюджет (condense_to_budget);
@@ -2333,28 +2467,39 @@ def _generate_chunk(
     trimmed = segments_dir / f"{name}-trim.wav"
     fitted = segments_dir / f"{name}.wav"
     voice = voice_map.get(segment.speaker, voice_map["female"])
-    spoken_text = chunk.text.strip() or segment.translated_text
+    # ВАЖНО: если у части нет своего текста, она молчит — но НЕ произносит всю
+    # реплику целиком. Иначе одна и та же фраза звучала дважды подряд.
+    spoken_text = chunk.text.strip()
+    if not spoken_text:
+        if position == 0:
+            spoken_text = segment.translated_text
+        else:
+            raise RuntimeError("У части реплики нет текста для озвучки")
     budget = max(0.4, chunk.budget or chunk.duration)
+    predicted = predict_total_duration(spoken_text, voice)
 
     client.tts(
         spoken_text,
         voice,
         raw,
         budget,
-        segment.style,
-        scene,
+        "" if simple else segment.style,
+        "" if simple else scene,
         segment.speaker,
-        context=segment.translated_text,
+        context="" if simple else segment.translated_text,
     )
     trim_edge_silence(raw, trimmed)
     measured = media_duration(trimmed)
     record_tts_duration(voice, spoken_text, measured)
 
-    if measured > budget * REGENERATE_OVERFLOW:
-        # Перегенерация: сначала подача и более короткий текст, и только потом DSP.
+    # Две причины переозвучить: (1) TTS «зациклился» и повторил фразу — это видно
+    # по длительности вдвое больше прогноза; (2) реплика не влезает в окно.
+    looped = measured > max(predicted * LOOP_DURATION_FACTOR, predicted + 1.0)
+    if looped or measured > budget * REGENERATE_OVERFLOW:
         retry_text = spoken_text
         if (
-            len(segment.chunks) == 1
+            not looped
+            and len(segment.chunks) == 1
             and segment.short_variant
             and predict_speech_duration(segment.short_variant, voice)
             < predict_speech_duration(spoken_text, voice)
@@ -2368,17 +2513,24 @@ def _generate_chunk(
                 voice,
                 retry_raw,
                 budget,
-                segment.style,
-                scene,
+                "" if simple else segment.style,
+                "" if simple else scene,
                 segment.speaker,
-                context=segment.translated_text,
-                pace="faster",
+                # При зацикливании убираем контекст: он и провоцирует повтор.
+                context="" if (simple or looped) else segment.translated_text,
+                pace="normal" if looped else "faster",
             )
             trim_edge_silence(retry_raw, retry_trimmed)
             retry_measured = media_duration(retry_trimmed)
             record_tts_duration(voice, retry_text, retry_measured)
             if retry_measured < measured:
                 trimmed, measured, spoken_text = retry_trimmed, retry_measured, retry_text
+                if looped:
+                    print(
+                        f"[dubbing] переозвучена зацикленная фраза {name} "
+                        f"({measured:.1f}с вместо прогноза {predicted:.1f}с)",
+                        flush=True,
+                    )
         except RuntimeError:
             pass  # перегенерация необязательна: остаётся первый вариант
 
@@ -2467,33 +2619,78 @@ def render_timeline(
             done += 1
             progress(45 + round(done / total * 40), f"Озвучено {done} из {total} фраз")
 
-    # Второй заход по упавшим группам — последовательно и без спешки.
-    # Чаще всего это временный сбой Gemini или лимит при параллельных запросах.
-    if retry:
-        for number, (unit, position, chunk) in enumerate(
-            sorted(retry, key=lambda item: item[2].onset), start=1
-        ):
-            progress(86, f"Повторная озвучка пропущенных фраз {number} из {len(retry)}")
-            time.sleep(1.0)
+    # Дальше — упорные повторные заходы. Пропущенная реплика означает, что в
+    # этом месте останется оригинальная английская речь, то есть «дырявый»
+    # дубляж со смесью языков. Это хуже любой другой ошибки, поэтому пробуем
+    # последовательно, с растущей паузой, а последний заход — в упрощённом
+    # режиме (без сцены, ремарки и контекста).
+    for attempt in range(2, TTS_PASSES + 1):
+        if not retry:
+            break
+        pending, retry = sorted(retry, key=lambda item: item[2].onset), []
+        for number, (unit, position, chunk) in enumerate(pending, start=1):
+            progress(
+                86,
+                f"Повторная озвучка пропущенных фраз {number} из {len(pending)} "
+                f"(заход {attempt} из {TTS_PASSES})",
+            )
+            time.sleep(1.5 * attempt)
             try:
                 generated[(unit.index, position)] = _generate_chunk(
-                    client, unit, chunk, position, voice_map, scene, segments_dir, speech_speed
+                    client,
+                    unit,
+                    chunk,
+                    position,
+                    voice_map,
+                    scene,
+                    segments_dir,
+                    speech_speed,
+                    simple=attempt >= TTS_PASSES,
                 )
                 errors.pop((unit.index, position), None)
             except Exception as exc:
                 errors[(unit.index, position)] = str(exc)
+                retry.append((unit, position, chunk))
 
     if not generated:
         first = "; ".join(list(errors.values())[:3])
         raise RuntimeError(f"Не удалось озвучить ни одну реплику. {first}")
 
+    speech_total = sum(chunk.duration for _, _, chunk in tasks)
+    missing_seconds = 0.0
     if errors:
-        report = "\n".join(
-            f"реплика {index + 1}, часть {position + 1}: {message}"
-            for (index, position), message in sorted(errors.items())
+        lines: list[str] = []
+        for unit, position, chunk in sorted(tasks, key=lambda item: item[2].onset):
+            message = errors.get((unit.index, position))
+            if not message:
+                continue
+            missing_seconds += chunk.duration
+            lines.append(
+                f"{chunk.onset:8.2f}s-{chunk.end:.2f}s остался оригинал "
+                f"({unit.speaker_label}): {chunk.text[:50]} | {message}"
+            )
+        report = "\n".join(lines)
+        (work_dir / "skipped.txt").write_text(report + "\n", encoding="utf-8")
+        print(
+            f"[dubbing] НЕ озвучено фраз: {len(errors)} "
+            f"({missing_seconds:.1f}с из {speech_total:.1f}с речи)\n{report}",
+            flush=True,
         )
-        (work_dir / "skipped.txt").write_text(report, encoding="utf-8")
-        print(f"[dubbing] пропущено фраз: {len(errors)}\n{report}", flush=True)
+        # Смесь языков — не «частичный успех», а брак: лучше явная ошибка с
+        # таймкодами, чем видео, где половина диалога осталась по-английски.
+        # Одну короткую фразу пережить можно, но не куски по несколько секунд.
+        if (
+            speech_total > 0
+            and missing_seconds > 1.5
+            and missing_seconds / speech_total > MAX_MISSING_SPEECH
+        ):
+            first = "; ".join(sorted({message for message in errors.values()})[:2])
+            raise RuntimeError(
+                f"Дубляж получился «дырявым»: {missing_seconds:.0f}с речи из "
+                f"{speech_total:.0f}с остались бы на оригинальном языке "
+                f"({len(errors)} фраз). Причина: {first}. Запустите снова или "
+                "снизьте TTS_CONCURRENCY — смешивать языки в одном ролике нельзя."
+            )
     skipped_count = len({index for index, _ in errors})
 
     previous_end = 0.0
@@ -2574,7 +2771,10 @@ def render_timeline(
     write_qa_report(ordered, transcript, work_dir / "qa.txt")
 
     output = work_dir / "dubbed.wav"
-    final_samples = timeline[: int(duration * sample_rate)]
+    # Последняя реплика не обрезается по концу видео: слово должно договориться.
+    # Раньше фраза на 44-й секунде 45-секундного ролика рубилась на полуслове.
+    keep_seconds = min(duration + TAIL_KEEP_SECONDS, max(duration, previous_end + 0.2))
+    final_samples = timeline[: int(keep_seconds * sample_rate)]
     if sys.byteorder != "little":
         final_samples.byteswap()
     with wave.open(str(output), "wb") as wav:
@@ -2682,9 +2882,10 @@ def mux_video(
                 "-filter_complex", f"[1:a:0]{voice_chain}[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
             ]
+        # Без -shortest: если последняя реплика чуть выходит за конец видео,
+        # она доигрывает целиком, а не обрывается на полуслове.
         return base + audio + video_codec + [
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-            "-shortest", str(output),
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
         ]
 
     try:
@@ -2782,7 +2983,9 @@ def auto_dubbing_pipeline(
         for unit in units:
             unit.speaker = registers.get(unit.speaker_label, "male")
         progress(34, "Уточняется начало речи по словам")
-        refined = refine_onsets(source_audio, units, diarization)
+        refined = refine_onsets(
+            source_audio, units, diarization, aligned=_alignment_state["applied"]
+        )
         assign_chunk_budgets(units, duration)
         print(
             f"[dubbing] реплик {len(units)}, групп "
@@ -2865,7 +3068,10 @@ def process_job(
         )
         message = "Дубляж готов"
         if skipped:
-            message = f"Дубляж готов, но {skipped} реплик(и) не удалось озвучить"
+            message = (
+                f"Дубляж готов, но {skipped} реплик(и) остались на языке оригинала — "
+                "таймкоды в skipped.txt"
+            )
         update_job(
             job_id,
             status="completed",
