@@ -554,6 +554,100 @@ def whisper_model():
 SENTENCE_END = (".", "!", "?", "…")
 CHUNK_MAX_SECONDS = 6.5   # не даём фразам-якорям быть слишком длинными
 CHUNK_GAP_SECONDS = 0.6   # пауза, по которой начинаем новую фразу
+PITCH_MALE_MAX_HZ = 155.0   # ниже этого — мужской голос
+PITCH_FEMALE_MIN_HZ = 175.0  # выше этого — женский голос
+
+
+def _estimate_pitch(samples: array, sample_rate: int) -> float:
+    """Оценивает основную частоту голоса (F0) автокорреляцией. 0.0 — не определено."""
+    if len(samples) < sample_rate // 8:
+        return 0.0
+
+    # Берём самый громкий участок — там голос, а не тишина/шум.
+    window = min(len(samples), sample_rate)  # до 1 секунды
+    best_start, best_energy = 0, -1.0
+    for start in range(0, max(1, len(samples) - window + 1), max(1, window // 4)):
+        chunk = samples[start : start + window]
+        energy = sum(abs(value) for value in chunk)
+        if energy > best_energy:
+            best_energy, best_start = energy, start
+    frame = samples[best_start : best_start + window]
+    if not frame:
+        return 0.0
+
+    mean = sum(frame) / len(frame)
+    signal = [float(value) - mean for value in frame]
+    power = sum(value * value for value in signal)
+    if power < 1e-6:
+        return 0.0
+
+    min_lag = max(2, int(sample_rate / 320))  # до 320 Гц
+    max_lag = min(len(signal) - 1, int(sample_rate / 70))  # до 70 Гц
+    if max_lag <= min_lag:
+        return 0.0
+
+    best_lag, best_score = 0, 0.0
+    for lag in range(min_lag, max_lag + 1):
+        score = 0.0
+        for index in range(0, len(signal) - lag, 2):  # шаг 2 — быстрее, точности хватает
+            score += signal[index] * signal[index + lag]
+        if score > best_score:
+            best_score, best_lag = score, lag
+
+    if not best_lag or best_score / power < 0.12:
+        return 0.0
+    return sample_rate / best_lag
+
+
+def detect_speaker_genders(
+    audio: Path, segments: list[dict[str, Any]]
+) -> dict[int, str]:
+    """Определяет пол говорящего в каждой реплике по высоте голоса в оригинале.
+
+    Это надёжнее, чем угадывать пол по смыслу текста: женский голос обычно
+    170-260 Гц, мужской 85-155 Гц.
+    """
+    genders: dict[int, str] = {}
+    try:
+        with wave.open(str(audio), "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                return genders
+            sample_rate = wav.getframerate()
+            total = wav.getnframes()
+            raw = wav.readframes(total)
+    except (wave.Error, OSError):
+        return genders
+
+    all_samples = array("h")
+    all_samples.frombytes(raw)
+    if sys.byteorder != "little":
+        all_samples.byteswap()
+
+    pitches: dict[int, float] = {}
+    for item in segments:
+        start = max(0, int(item["start"] * sample_rate))
+        end = min(len(all_samples), int(item["end"] * sample_rate))
+        if end - start < sample_rate // 8:
+            continue
+        pitch = _estimate_pitch(all_samples[start:end], sample_rate)
+        if pitch > 0:
+            pitches[item["index"]] = pitch
+
+    if not pitches:
+        return genders
+
+    # Порог между голосами: по середине диапазона, но в разумных границах.
+    values = sorted(pitches.values())
+    median = values[len(values) // 2]
+    threshold = min(max(median, PITCH_MALE_MAX_HZ), PITCH_FEMALE_MIN_HZ)
+    for index, pitch in pitches.items():
+        if pitch < PITCH_MALE_MAX_HZ:
+            genders[index] = "male"
+        elif pitch > PITCH_FEMALE_MIN_HZ:
+            genders[index] = "female"
+        else:
+            genders[index] = "male" if pitch <= threshold else "female"
+    return genders
 
 
 def _clean_words(text: str) -> str:
@@ -707,17 +801,35 @@ def _generate_segment(
     spoken_text = segment.translated_text
     client.tts(spoken_text, voice, raw, budget, segment.style, scene)
     trim_lead_silence(raw, trimmed)
-    shorten_attempts = 0
-    while (
-        media_duration(trimmed) > budget * 1.35
-        and len(spoken_text) > 12
-        and shorten_attempts < 2
-    ):
-        spoken_text = client.shorten(spoken_text, budget)
-        client.tts(spoken_text, voice, raw, budget, segment.style, scene)
-        trim_lead_silence(raw, trimmed)
-        shorten_attempts += 1
-    normalize_and_fit(trimmed, fitted, segment.duration, budget)
+
+    # Умная подгонка: пока реплика не влезает, просим Gemini сократить текст и
+    # озвучиваем заново. Ускорение через FFmpeg — только крайняя мера, поэтому
+    # речь не тараторит. Держим лучший (самый близкий к окну) вариант.
+    best = trimmed
+    best_overflow = media_duration(trimmed) - budget
+    attempts = 0
+    while best_overflow > budget * 0.08 and len(spoken_text) > 12 and attempts < 3:
+        attempts += 1
+        try:
+            shorter = client.shorten(spoken_text, budget)
+        except RuntimeError:
+            break
+        if not shorter or shorter == spoken_text:
+            break
+        candidate_raw = segments_dir / f"{segment.index:04d}-raw{attempts}.wav"
+        candidate = segments_dir / f"{segment.index:04d}-trim{attempts}.wav"
+        try:
+            client.tts(shorter, voice, candidate_raw, budget, segment.style, scene)
+            trim_lead_silence(candidate_raw, candidate)
+            overflow = media_duration(candidate) - budget
+        except RuntimeError:
+            break
+        if overflow < best_overflow:
+            best, best_overflow, spoken_text = candidate, overflow, shorter
+        if overflow <= budget * 0.08:
+            break
+
+    normalize_and_fit(best, fitted, segment.duration, budget)
     return fitted, spoken_text, voice
 
 
@@ -767,13 +879,27 @@ def render_timeline(
             ): segment
             for segment in segments
         }
+        failures: list[str] = []
         for future in as_completed(futures):
             segment = futures[future]
-            generated[segment.index] = future.result()
+            try:
+                generated[segment.index] = future.result()
+            except Exception as exc:
+                # Сбой одной реплики не должен рушить весь дубляж — пропускаем её.
+                failures.append(f"реплика {segment.index + 1}: {exc}")
             done += 1
             progress(45 + round(done / total * 40), f"Озвучено {done} из {total} реплик")
 
+    if not generated:
+        raise RuntimeError(
+            "Не удалось озвучить ни одну реплику. " + ("; ".join(failures[:3]) if failures else "")
+        )
+    if failures:
+        (work_dir / "skipped.txt").write_text("\n".join(failures), encoding="utf-8")
+
     for segment in ordered:
+        if segment.index not in generated:
+            continue
         fitted, spoken_text, voice = generated[segment.index]
         clip = read_mono_pcm(fitted)
         start_sample = max(0, int(segment.start * sample_rate))
@@ -805,17 +931,48 @@ def render_timeline(
     (work_dir / "segments.json").write_text(
         json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    write_srt(transcript, work_dir / "uzbek.srt")
     return output
 
 
-def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
+def _srt_time(value: float) -> str:
+    value = max(0.0, value)
+    hours, rest = divmod(int(value), 3600)
+    minutes, seconds = divmod(rest, 60)
+    millis = int(round((value - int(value)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def write_srt(transcript: list[dict[str, Any]], output: Path) -> None:
+    """Сохраняет узбекские субтитры в формате SRT."""
+    blocks: list[str] = []
+    for number, item in enumerate(transcript, start=1):
+        text = str(item.get("uzbek", "")).strip()
+        if not text:
+            continue
+        start = _srt_time(float(item["start"]))
+        end = _srt_time(float(item["end"]))
+        blocks.append(f"{number}\n{start} --> {end}\n{text}\n")
+    output.write_text("\n".join(blocks), encoding="utf-8")
+
+
+def mux_video(
+    video: Path,
+    dubbed: Path,
+    output: Path,
+    mode: str,
+    original_volume: float = 0.5,
+    dub_volume: float = 1.0,
+) -> None:
     should_mix = mode == "mix" and has_audio(video)
+    original_volume = min(max(original_volume, 0.0), 1.5)
+    dub_volume = min(max(dub_volume, 0.2), 2.0)
 
     # Обработка голоса как на студии: мягкий компрессор выравнивает динамику,
     # loudnorm приводит к вещательному уровню громкости.
     voice_chain = (
         "acompressor=threshold=-20dB:ratio=3:attack=8:release=180:makeup=2,"
-        "loudnorm=I=-16:TP=-1.5:LRA=11"
+        f"loudnorm=I=-16:TP=-1.5:LRA=11,volume={dub_volume:.2f}"
     )
 
     def command(video_codec: list[str]) -> list[str]:
@@ -826,7 +983,7 @@ def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
             audio = [
                 "-filter_complex",
                 f"[1:a:0]{voice_chain},asplit=2[dub][key];"
-                "[0:a:0]volume=0.5[orig];"
+                f"[0:a:0]volume={original_volume:.2f}[orig];"
                 "[orig][key]sidechaincompress=threshold=0.02:ratio=12:attack=5:release=350[duck];"
                 "[duck][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
@@ -852,12 +1009,36 @@ def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
 # Полностью автоматический процесс дубляжа
 # -----------------------------------------------------------------------------
 
+STYLE_PRESETS = {
+    "auto": "",
+    "cinema": (
+        "Cinematic drama dubbing: rich emotional range, expressive delivery, "
+        "strong character presence, dramatic pacing."
+    ),
+    "vlog": (
+        "Casual vlog dubbing: friendly, upbeat, spontaneous and conversational, "
+        "like talking to a friend on camera."
+    ),
+    "news": (
+        "News/documentary dubbing: clear, confident, authoritative and measured, "
+        "neutral but engaged tone."
+    ),
+    "comedy": (
+        "Comedy dubbing: playful, lively, exaggerated timing, teasing energy "
+        "and expressive punchlines."
+    ),
+}
+
+
 def auto_dubbing_pipeline(
     input_path: Path,
     output_path: Path,
     language: str | None,
     voice_map: dict[str, str],
     audio_mode: str,
+    style_preset: str,
+    original_volume: float,
+    dub_volume: float,
     progress: ProgressCallback,
 ) -> None:
     work_dir = input_path.parent
@@ -878,8 +1059,18 @@ def auto_dubbing_pipeline(
     try:
         progress(32, "Анализируется сцена и характеры")
         scene = client.analyze_scene(source_segments)
+        preset = STYLE_PRESETS.get(style_preset, "")
+        if preset:
+            scene = f"{preset}\n{scene}".strip()
         progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments, scene)
+        progress(42, "Определяются голоса говорящих")
+        genders = detect_speaker_genders(source_audio, source_segments)
+        for segment in translated:
+            detected = genders.get(segment.index)
+            if detected:  # питч из оригинала надёжнее догадки по тексту
+                segment.speaker = detected
+
         progress(43, "Вычитывается узбекский текст")
         client.polish(translated)
         progress(45, "Создаётся узбекская озвучка")
@@ -890,7 +1081,7 @@ def auto_dubbing_pipeline(
         client.close()
 
     progress(90, "Собирается готовое видео")
-    mux_video(input_path, dubbed, output_path, audio_mode)
+    mux_video(input_path, dubbed, output_path, audio_mode, original_volume, dub_volume)
     progress(98, "Проверяется результат")
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError("FFmpeg не создал итоговое видео")
@@ -903,6 +1094,9 @@ def process_job(
     language: str | None,
     voice_map: dict[str, str],
     audio_mode: str,
+    style_preset: str,
+    original_volume: float,
+    dub_volume: float,
 ) -> None:
     output_path = input_path.parent / "uzbek-dubbed.mp4"
 
@@ -910,7 +1104,17 @@ def process_job(
         update_job(job_id, status="processing", progress=percent, message=message)
 
     try:
-        auto_dubbing_pipeline(input_path, output_path, language, voice_map, audio_mode, progress)
+        auto_dubbing_pipeline(
+            input_path,
+            output_path,
+            language,
+            voice_map,
+            audio_mode,
+            style_preset,
+            original_volume,
+            dub_volume,
+            progress,
+        )
         update_job(
             job_id,
             status="completed",
@@ -981,6 +1185,9 @@ async def create_job(
     female_voice: str = Form(DEFAULT_FEMALE_VOICE),
     male_voice: str = Form(DEFAULT_MALE_VOICE),
     audio_mode: str = Form("mix"),
+    style_preset: str = Form("auto"),
+    original_volume: float = Form(0.5),
+    dub_volume: float = Form(1.0),
 ) -> dict[str, Any]:
     if not os.getenv("GEMINI_API_KEY", "").strip():
         raise HTTPException(status_code=503, detail="На сервере не задан GEMINI_API_KEY")
@@ -990,6 +1197,8 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Неизвестный голос")
     if audio_mode not in {"mix", "replace"}:
         raise HTTPException(status_code=400, detail="Неизвестный режим звука")
+    if style_preset not in STYLE_PRESETS:
+        raise HTTPException(status_code=400, detail="Неизвестный стиль озвучки")
 
     suffix = Path(video.filename or "video.mp4").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -1036,6 +1245,9 @@ async def create_job(
         None if source_language == "auto" else source_language,
         {"female": female_voice, "male": male_voice},
         audio_mode,
+        style_preset,
+        original_volume,
+        dub_volume,
     )
     return public_job(job)
 
@@ -1066,6 +1278,21 @@ def result(job_id: str) -> FileResponse:
         media_type="video/mp4",
         headers={"Content-Disposition": 'inline; filename="uzbek-dubbed.mp4"'},
     )
+
+
+@app.get("/api/jobs/{job_id}/subtitles")
+def subtitles(job_id: str) -> FileResponse:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        result_path = job.get("result_path")
+        if job["status"] != "completed" or not result_path:
+            raise HTTPException(status_code=409, detail="Субтитры ещё не готовы")
+    path = Path(result_path).parent / "uzbek.srt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Субтитры не найдены")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename="uzbek.srt")
 
 
 @atexit.register
@@ -1110,6 +1337,8 @@ fieldset{border:0;padding:0;margin:22px 0 0}legend{margin-bottom:9px}
 .primary,.download{display:block;width:100%;border:0;border-radius:3px;background:var(--gold);color:#12121a;padding:16px;font:700 12px ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;text-align:center;cursor:pointer;text-decoration:none}
 .primary:disabled{background:var(--line);color:var(--dim);cursor:wait}
 .adv{margin-top:14px;color:var(--dim);font-size:11px;cursor:pointer;text-decoration:underline}
+input[type=range]{width:100%;margin-top:10px;accent-color:var(--gold)}
+.ghost-dl{background:transparent;border:1px solid var(--line);color:var(--dim);margin-top:10px}
 .error{color:#ee736c;font-size:12px;line-height:1.6;display:none;margin-top:12px}.error.show{display:block}
 .progress,.result{margin-top:18px}
 .head{display:flex;align-items:center;justify-content:space-between;font-size:12px}
@@ -1135,17 +1364,31 @@ footer{color:var(--dim);text-align:center;font-size:10px;margin-top:30px}
     <div><label for="femaleVoice">Женский голос</label><select id="femaleVoice" name="female_voice"></select></div>
     <div><label for="maleVoice">Мужской голос</label><select id="maleVoice" name="male_voice"></select></div>
   </div>
+  <div style="margin-top:16px"><label for="stylePreset">Стиль озвучки</label>
+  <select id="stylePreset" name="style_preset">
+    <option value="auto">Авто (по сцене)</option>
+    <option value="cinema">Кино / драма</option>
+    <option value="vlog">Влог / разговорный</option>
+    <option value="news">Новости / документальный</option>
+    <option value="comedy">Комедия</option>
+  </select></div>
   <fieldset><legend>Оригинальный звук</legend>
-    <label class="option"><input type="radio" name="audio_mode" value="mix" checked><span><strong>Тихий фон</strong><small>Оригинал на громкости 18%</small></span></label>
+    <label class="option"><input type="radio" name="audio_mode" value="mix" checked><span><strong>Тихий фон</strong><small>Оригинал приглушается под речью</small></span></label>
     <label class="option"><input type="radio" name="audio_mode" value="replace"><span><strong>Полная замена</strong><small>Только узбекская речь</small></span></label>
   </fieldset>
+  <div class="grid" style="margin-top:16px">
+    <div><label for="origVol">Громкость оригинала: <span id="origVolVal">50%</span></label>
+    <input type="range" id="origVol" name="original_volume" min="0" max="1.2" step="0.05" value="0.5"></div>
+    <div><label for="dubVol">Громкость дубляжа: <span id="dubVolVal">100%</span></label>
+    <input type="range" id="dubVol" name="dub_volume" min="0.4" max="1.6" step="0.05" value="1"></div>
+  </div>
 </div>
 </section>
 <button class="primary" id="submit" type="submit">Создать узбекский дубляж</button><p class="error" id="error" role="alert"></p></form>
 
 <section class="panel progress" id="progress" hidden><div class="head"><div><span class="dot"></span><span id="status">Подготовка…</span></div><strong id="percent">0%</strong></div><div class="track"><div class="bar" id="bar"></div></div><p class="hint">Не закрывайте страницу до окончания обработки.</p></section>
 
-<section class="panel result" id="result" hidden><p class="title">Готовый дубляж</p><video id="player" controls playsinline></video><a class="download" id="download" download="uzbek-dubbed.mp4">Скачать видео</a></section>
+<section class="panel result" id="result" hidden><p class="title">Готовый дубляж</p><video id="player" controls playsinline></video><a class="download" id="download" download="uzbek-dubbed.mp4">Скачать видео</a><a class="download ghost-dl" id="srtLink" download="uzbek.srt">Скачать субтитры (.srt)</a></section>
 <footer>Gemini API key хранится только на сервере · файлы удаляются через 24 часа</footer></main>
 
 <script>
@@ -1154,8 +1397,13 @@ const $=s=>document.querySelector(s);
 const form=$('#form'),video=$('#video'),drop=$('#drop'),fileName=$('#fileName'),fileMeta=$('#fileMeta'),submit=$('#submit'),error=$('#error');
 const progress=$('#progress'),bar=$('#bar'),percent=$('#percent'),statusText=$('#status');
 const advToggle=$('#advToggle'),advBox=$('#advBox'),femaleVoice=$('#femaleVoice'),maleVoice=$('#maleVoice');
-const result=$('#result'),player=$('#player'),download=$('#download');
+const result=$('#result'),player=$('#player'),download=$('#download'),srtLink=$('#srtLink');
+const origVol=$('#origVol'),dubVol=$('#dubVol'),origVolVal=$('#origVolVal'),dubVolVal=$('#dubVolVal');
 let timer=null;
+
+const pct=v=>Math.round(Number(v)*100)+'%';
+origVol.oninput=()=>origVolVal.textContent=pct(origVol.value);
+dubVol.oninput=()=>dubVolVal.textContent=pct(dubVol.value);
 
 VOICES.forEach(v=>{femaleVoice.add(new Option(v,v));maleVoice.add(new Option(v,v));});
 femaleVoice.value=DEF_FEMALE;maleVoice.value=DEF_MALE;
@@ -1179,6 +1427,7 @@ async function poll(id){
     if(j.status==='completed'){
       submit.disabled=false;submit.textContent='Создать ещё один дубляж';progress.hidden=true;
       const url=j.result_url+'?t='+Date.now();player.src=url;download.href=url;
+      srtLink.href=`/api/jobs/${id}/subtitles?t=`+Date.now();
       result.hidden=false;result.scrollIntoView({behavior:'smooth'});return;
     }
     if(j.status==='failed'){submit.disabled=false;submit.textContent='Попробовать снова';progress.hidden=true;fail(j.error||'Не удалось создать дубляж');return}
