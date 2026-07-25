@@ -554,58 +554,133 @@ def whisper_model():
 SENTENCE_END = (".", "!", "?", "…")
 CHUNK_MAX_SECONDS = 6.5   # не даём фразам-якорям быть слишком длинными
 CHUNK_GAP_SECONDS = 0.6   # пауза, по которой начинаем новую фразу
-PITCH_MALE_MAX_HZ = 155.0   # ниже этого — мужской голос
-PITCH_FEMALE_MIN_HZ = 175.0  # выше этого — женский голос
 
 
-def _estimate_pitch(samples: array, sample_rate: int) -> float:
-    """Оценивает основную частоту голоса (F0) автокорреляцией. 0.0 — не определено."""
-    if len(samples) < sample_rate // 8:
+PITCH_RATE = 8000       # частота для анализа питча (достаточно для F0)
+PITCH_MIN_HZ = 70.0
+PITCH_MAX_HZ = 400.0
+PITCH_SPLIT_HZ = 165.0  # граница мужской/женский, если говорящий один
+
+
+def make_pitch_audio(video: Path, output: Path) -> None:
+    """Готовит аудио для анализа питча: моно 8 кГц + полоса 70-400 Гц.
+
+    Полосовой фильтр убирает музыку, шум и обертоны выше основного тона —
+    без него автокорреляция часто ошибается на живой речи.
+    """
+    run_command(
+        [
+            "ffmpeg", "-y", "-i", str(video), "-vn",
+            "-af", "highpass=f=65,lowpass=f=420,dynaudnorm",
+            "-ac", "1", "-ar", str(PITCH_RATE), "-c:a", "pcm_s16le", str(output),
+        ]
+    )
+
+
+def _frame_pitch(signal: list[float], sample_rate: int) -> float:
+    """Питч одного кадра через нормализованную автокорреляцию с коррекцией октавы."""
+    count = len(signal)
+    mean = sum(signal) / count
+    centred = [value - mean for value in signal]
+    power = sum(value * value for value in centred)
+    if power < 1e-3:
         return 0.0
 
-    # Берём самый громкий участок — там голос, а не тишина/шум.
-    window = min(len(samples), sample_rate)  # до 1 секунды
-    best_start, best_energy = 0, -1.0
-    for start in range(0, max(1, len(samples) - window + 1), max(1, window // 4)):
-        chunk = samples[start : start + window]
-        energy = sum(abs(value) for value in chunk)
-        if energy > best_energy:
-            best_energy, best_start = energy, start
-    frame = samples[best_start : best_start + window]
-    if not frame:
-        return 0.0
-
-    mean = sum(frame) / len(frame)
-    signal = [float(value) - mean for value in frame]
-    power = sum(value * value for value in signal)
-    if power < 1e-6:
-        return 0.0
-
-    min_lag = max(2, int(sample_rate / 320))  # до 320 Гц
-    max_lag = min(len(signal) - 1, int(sample_rate / 70))  # до 70 Гц
+    min_lag = max(2, int(sample_rate / PITCH_MAX_HZ))
+    max_lag = min(count // 2, int(sample_rate / PITCH_MIN_HZ))
     if max_lag <= min_lag:
         return 0.0
 
+    scores: dict[int, float] = {}
     best_lag, best_score = 0, 0.0
     for lag in range(min_lag, max_lag + 1):
-        score = 0.0
-        for index in range(0, len(signal) - lag, 2):  # шаг 2 — быстрее, точности хватает
-            score += signal[index] * signal[index + lag]
-        if score > best_score:
-            best_score, best_lag = score, lag
+        total = 0.0
+        for index in range(count - lag):
+            total += centred[index] * centred[index + lag]
+        norm = total / power
+        scores[lag] = norm
+        if norm > best_score:
+            best_score, best_lag = norm, lag
 
-    if not best_lag or best_score / power < 0.12:
+    if not best_lag or best_score < 0.3:
         return 0.0
+
+    # Коррекция октавы: автокорреляция любит удвоенный период (вдвое ниже тон).
+    half = best_lag // 2
+    if half >= min_lag and scores.get(half, 0.0) >= best_score * 0.8:
+        best_lag = half
     return sample_rate / best_lag
 
 
-def detect_speaker_genders(
-    audio: Path, segments: list[dict[str, Any]]
-) -> dict[int, str]:
+def _segment_pitch(samples: array, sample_rate: int) -> float:
+    """Медианный питч по многим кадрам — устойчив к шуму и выбросам."""
+    frame = 512                      # 64 мс при 8 кГц
+    hop = 256
+    if len(samples) < frame:
+        return 0.0
+
+    # Берём только достаточно громкие кадры (там речь, а не пауза).
+    frames: list[tuple[float, int]] = []
+    for start in range(0, len(samples) - frame + 1, hop):
+        chunk = samples[start : start + frame]
+        energy = sum(abs(value) for value in chunk) / frame
+        frames.append((energy, start))
+    if not frames:
+        return 0.0
+    loudest = max(energy for energy, _ in frames)
+    if loudest < 50:
+        return 0.0
+
+    candidates = [start for energy, start in frames if energy >= loudest * 0.35]
+    if len(candidates) > 24:  # ограничиваем работу, распределяя кадры по реплике
+        step = len(candidates) / 24
+        candidates = [candidates[int(i * step)] for i in range(24)]
+
+    values: list[float] = []
+    for start in candidates:
+        signal = [float(value) for value in samples[start : start + frame]]
+        pitch = _frame_pitch(signal, sample_rate)
+        if PITCH_MIN_HZ <= pitch <= PITCH_MAX_HZ:
+            values.append(pitch)
+
+    if len(values) < 3:
+        return 0.0
+    values.sort()
+    return values[len(values) // 2]
+
+
+def _split_two_speakers(pitches: list[float]) -> float | None:
+    """Ищет границу между двумя голосами (1D k-means). None — говорящий один."""
+    if len(pitches) < 4:
+        return None
+    low, high = min(pitches), max(pitches)
+    if high - low < 45.0:
+        return None
+
+    centre_low, centre_high = low, high
+    for _ in range(25):
+        group_low = [p for p in pitches if abs(p - centre_low) <= abs(p - centre_high)]
+        group_high = [p for p in pitches if abs(p - centre_low) > abs(p - centre_high)]
+        if not group_low or not group_high:
+            return None
+        new_low = sum(group_low) / len(group_low)
+        new_high = sum(group_high) / len(group_high)
+        if abs(new_low - centre_low) < 0.5 and abs(new_high - centre_high) < 0.5:
+            centre_low, centre_high = new_low, new_high
+            break
+        centre_low, centre_high = new_low, new_high
+
+    if centre_high - centre_low < 40.0:
+        return None  # разброс слишком мал — это один голос
+    return (centre_low + centre_high) / 2
+
+
+def detect_speaker_genders(audio: Path, segments: list[dict[str, Any]]) -> dict[int, str]:
     """Определяет пол говорящего в каждой реплике по высоте голоса в оригинале.
 
-    Это надёжнее, чем угадывать пол по смыслу текста: женский голос обычно
-    170-260 Гц, мужской 85-155 Гц.
+    Надёжнее догадки по тексту. Сначала считаем медианный питч каждой реплики,
+    затем делим реплики на два голоса кластеризацией — так работает и когда у
+    конкретного человека голос выше/ниже среднего.
     """
     genders: dict[int, str] = {}
     try:
@@ -613,8 +688,7 @@ def detect_speaker_genders(
             if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
                 return genders
             sample_rate = wav.getframerate()
-            total = wav.getnframes()
-            raw = wav.readframes(total)
+            raw = wav.readframes(wav.getnframes())
     except (wave.Error, OSError):
         return genders
 
@@ -627,26 +701,25 @@ def detect_speaker_genders(
     for item in segments:
         start = max(0, int(item["start"] * sample_rate))
         end = min(len(all_samples), int(item["end"] * sample_rate))
-        if end - start < sample_rate // 8:
+        if end - start < sample_rate // 5:
             continue
-        pitch = _estimate_pitch(all_samples[start:end], sample_rate)
+        pitch = _segment_pitch(all_samples[start:end], sample_rate)
         if pitch > 0:
             pitches[item["index"]] = pitch
 
     if not pitches:
         return genders
 
-    # Порог между голосами: по середине диапазона, но в разумных границах.
-    values = sorted(pitches.values())
-    median = values[len(values) // 2]
-    threshold = min(max(median, PITCH_MALE_MAX_HZ), PITCH_FEMALE_MIN_HZ)
+    boundary = _split_two_speakers(list(pitches.values()))
+    if boundary is None:
+        # Один говорящий (или неотличимые голоса) — решаем по абсолютной границе.
+        values = sorted(pitches.values())
+        median = values[len(values) // 2]
+        label = "male" if median < PITCH_SPLIT_HZ else "female"
+        return {index: label for index in pitches}
+
     for index, pitch in pitches.items():
-        if pitch < PITCH_MALE_MAX_HZ:
-            genders[index] = "male"
-        elif pitch > PITCH_FEMALE_MIN_HZ:
-            genders[index] = "female"
-        else:
-            genders[index] = "male" if pitch <= threshold else "female"
+        genders[index] = "male" if pitch < boundary else "female"
     return genders
 
 
@@ -1065,7 +1138,12 @@ def auto_dubbing_pipeline(
         progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments, scene)
         progress(42, "Определяются голоса говорящих")
-        genders = detect_speaker_genders(source_audio, source_segments)
+        pitch_audio = work_dir / "pitch.wav"
+        try:
+            make_pitch_audio(input_path, pitch_audio)
+            genders = detect_speaker_genders(pitch_audio, source_segments)
+        except RuntimeError:
+            genders = {}  # определение пола необязательно — не валим дубляж
         for segment in translated:
             detected = genders.get(segment.index)
             if detected:  # питч из оригинала надёжнее догадки по тексту
