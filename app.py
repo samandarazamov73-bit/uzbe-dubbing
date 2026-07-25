@@ -72,11 +72,13 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.25  # предельное ускорение: выше — речь звучит как скороговорка
+MAX_SPEED_UP_RATIO = 1.3   # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
-ONSET_OFFSET = -0.5        # узбекский голос начинает говорить на 0.5 с раньше
+ONSET_OFFSET = 0.0         # старт по реально найденному началу речи
+MAX_POLITE_SHIFT = 0.45    # насколько сдвинуть ответ, чтобы не резать предыдущего
+OVERLAP_DUCK = 0.55        # насколько приглушить перебиваемого при нахлёсте
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -1013,7 +1015,13 @@ def detect_speech_onsets(
     frame = max(1, rate // 100)  # кадр 10 мс
     for item in segments:
         search_from = max(0, int((item["start"] - 0.15) * rate))
-        search_to = min(len(samples), int((item["start"] + 0.7) * rate))
+        # Ищем дальше вперёд: распознавание могло принять за начало фразы
+        # вздох или смешок за секунду до настоящей речи.
+        search_to = min(
+            len(samples),
+            int((item["start"] + 1.5) * rate),
+            max(0, int((item["end"] - 0.2) * rate)),
+        )
         body_to = min(len(samples), int(item["end"] * rate))
         if body_to - search_from < frame * 3:
             continue
@@ -1025,17 +1033,26 @@ def detect_speech_onsets(
             continue
         threshold = peak * 0.18
 
+        # Требуем, чтобы громкость держалась несколько кадров подряд: иначе
+        # короткий вздох или смешок принимается за начало фразы и дубляж
+        # вступает слишком рано.
         position = search_from
         found: float | None = None
+        streak = 0
+        needed = 12  # 120 мс непрерывной речи — вздох/смешок столько не держится
         while position + frame <= search_to:
             chunk = samples[position : position + frame]
             level = max(abs(v) for v in chunk)
             if level >= threshold:
-                found = position / rate
-                break
+                streak += 1
+                if streak >= needed:
+                    found = (position - frame * (needed - 1)) / rate
+                    break
+            else:
+                streak = 0
             position += frame
         if found is not None:
-            onsets[item["index"]] = found
+            onsets[item["index"]] = max(0.0, found)
     return onsets
 
 
@@ -1187,8 +1204,9 @@ def normalize_and_fit(
     if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
     final_length = actual / ratio
-    chain.append("afade=t=in:st=0:d=0.015")
-    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.06):.3f}:d=0.06")
+    # Более длинные микрофейды полностью убирают щелчки на стыках реплик.
+    chain.append("afade=t=in:st=0:d=0.02")
+    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.08):.3f}:d=0.08")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
@@ -1404,22 +1422,38 @@ def render_timeline(
 
     # Раскладка без наложений: реплика никогда не начинается, пока звучит
     # предыдущая. Иначе мужской голос «перебивает» женский, говоря одновременно.
-    # Каждая реплика ставится РОВНО в своё время из видео — никаких сдвигов.
-    # Поэтому дубляж не уползает, а перебивания совпадают с оригиналом сами собой.
+    previous_end = 0.0
+    previous_source_end: float | None = None
     for segment in ordered:
         if segment.index not in generated:
             continue
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-        # Начало речи уточнено по энергии оригинала и дополнительно сдвинуто
-        # раньше на ONSET_OFFSET, чтобы дубляж не отставал от артикуляции.
         placement = max(0.0, segment.start + ONSET_OFFSET)
+
+        # Если в оригинале НЕ перебивают, а узбекская реплика предыдущего ещё
+        # звучит — слегка сдвигаем ответ, чтобы не «резать» человека на полуслове.
+        interrupts_in_source = (
+            previous_source_end is not None
+            and segment.start < previous_source_end - SOURCE_OVERLAP_EPS
+        )
+        if not interrupts_in_source and placement < previous_end:
+            placement = min(previous_end + 0.05, placement + MAX_POLITE_SHIFT)
+
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
-            mixed = timeline[start_sample + index] + clip[index]
-            timeline[start_sample + index] = max(-32768, min(32767, mixed))
+            position = start_sample + index
+            existing = timeline[position]
+            # При настоящем перебивании приглушаем того, кого перебивают, вместо
+            # того чтобы обрывать его — так стык звучит естественно.
+            if existing and clip[index]:
+                existing = int(existing * OVERLAP_DUCK)
+            mixed = existing + clip[index]
+            timeline[position] = max(-32768, min(32767, mixed))
+        previous_end = max(previous_end, placement + clip_seconds)
+        previous_source_end = segment.end
         transcript.append(
             {
                 "start": round(placement, 3),
