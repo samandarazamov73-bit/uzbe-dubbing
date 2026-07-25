@@ -317,6 +317,55 @@ class GeminiClient:
             )
         return translated
 
+    def polish(self, segments: list[DubSegment]) -> None:
+        """Второй проход: Gemini перечитывает свой узбекский текст и исправляет огрехи.
+
+        Ловит то, что часто портит первый проход: задвоенные слова, кальки с
+        русского/английского, неестественные обороты, ошибки в латинице.
+        """
+        for offset in range(0, len(segments), 30):
+            batch = segments[offset : offset + 30]
+            payload = [
+                {"id": s.index, "source": s.source_text, "uzbek": s.translated_text}
+                for s in batch
+            ]
+            prompt = (
+                "Ты редактор-носитель узбекского языка, вычитываешь текст дубляжа. Для каждой "
+                "строки сверь uzbek с source и исправь: задвоенные и лишние слова, кальки с "
+                "русского/английского, неестественные обороты, ошибки грамматики и узбекской "
+                "латиницы, неверный смысл. Сохрани примерно ту же длину и разговорный стиль — "
+                "это устная речь для озвучки. Если строка уже хороша, верни её без изменений. "
+                'Верни только JSON-массив [{"id":0,"uzbek":"..."}].\n\nСТРОКИ:\n'
+                + json.dumps(payload, ensure_ascii=False)
+            )
+            try:
+                data = self._post(
+                    self.text_model,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generation_config": {
+                            "temperature": 0.2,
+                            "response_mime_type": "application/json",
+                        },
+                    },
+                )
+                result = self._json(self._response_text(data))
+            except RuntimeError:
+                continue  # вычитка необязательна — при сбое оставляем первый перевод
+            if isinstance(result, dict):
+                result = result.get("segments", result.get("lines", []))
+            if not isinstance(result, list):
+                continue
+            fixed = {
+                int(item["id"]): str(item["uzbek"]).strip()
+                for item in result
+                if isinstance(item, dict) and item.get("uzbek") and "id" in item
+            }
+            for segment in batch:
+                better = fixed.get(segment.index)
+                if better:
+                    segment.translated_text = better
+
     def shorten(self, text: str, duration: float) -> str:
         prompt = (
             f"Слегка сократи эту узбекскую реплику, чтобы её можно было произнести НЕ спеша "
@@ -688,10 +737,18 @@ def render_timeline(
     transcript: list[dict[str, Any]] = []
 
     ordered = sorted(segments, key=lambda s: s.start)
+    # Бюджет = окно оригинала + пауза до следующей реплики. Небольшой зазор перед
+    # следующей фразой сохраняем, чтобы реплики не наезжали и диалог звучал живо.
     budgets: dict[int, float] = {}
     for position, segment in enumerate(ordered):
-        next_start = ordered[position + 1].start if position + 1 < len(ordered) else duration
-        budgets[segment.index] = max(0.5, next_start - segment.start - 0.03)
+        if position + 1 < len(ordered):
+            next_start = ordered[position + 1].start
+            gap = max(0.0, next_start - segment.end)
+            reserve = min(0.12, gap * 0.35)  # не съедаем всю паузу перед ответом
+            budget = next_start - segment.start - reserve
+        else:
+            budget = duration - segment.start
+        budgets[segment.index] = max(0.5, budget)
 
     generated: dict[int, tuple[Path, str, str]] = {}
     total = len(segments)
@@ -754,21 +811,29 @@ def render_timeline(
 def mux_video(video: Path, dubbed: Path, output: Path, mode: str) -> None:
     should_mix = mode == "mix" and has_audio(video)
 
-    # loudnorm выравнивает громкость узбекской озвучки до вещательного уровня.
-    loudnorm = "loudnorm=I=-16:TP=-1.5:LRA=11"
+    # Обработка голоса как на студии: мягкий компрессор выравнивает динамику,
+    # loudnorm приводит к вещательному уровню громкости.
+    voice_chain = (
+        "acompressor=threshold=-20dB:ratio=3:attack=8:release=180:makeup=2,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+    )
 
     def command(video_codec: list[str]) -> list[str]:
         base = ["ffmpeg", "-y", "-i", str(video), "-i", str(dubbed)]
         if should_mix:
+            # sidechaincompress = ducking: оригинал автоматически притухает ровно
+            # там, где звучит узбекская речь, поэтому дубляж всегда разборчив.
             audio = [
                 "-filter_complex",
-                f"[1:a:0]{loudnorm}[dub];[0:a:0]volume=0.16[orig];"
-                "[orig][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
+                f"[1:a:0]{voice_chain},asplit=2[dub][key];"
+                "[0:a:0]volume=0.5[orig];"
+                "[orig][key]sidechaincompress=threshold=0.02:ratio=12:attack=5:release=350[duck];"
+                "[duck][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
             ]
         else:
             audio = [
-                "-filter_complex", f"[1:a:0]{loudnorm}[aout]",
+                "-filter_complex", f"[1:a:0]{voice_chain}[aout]",
                 "-map", "0:v:0", "-map", "[aout]",
             ]
         return base + audio + video_codec + [
@@ -813,8 +878,10 @@ def auto_dubbing_pipeline(
     try:
         progress(32, "Анализируется сцена и характеры")
         scene = client.analyze_scene(source_segments)
-        progress(40, f"Переводятся {len(source_segments)} реплик на узбекский")
+        progress(38, f"Переводятся {len(source_segments)} реплик на узбекский")
         translated = client.translate(source_segments, scene)
+        progress(43, "Вычитывается узбекский текст")
+        client.polish(translated)
         progress(45, "Создаётся узбекская озвучка")
         dubbed = render_timeline(
             duration, translated, client, voice_map, scene, work_dir, progress
