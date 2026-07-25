@@ -72,10 +72,11 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.15  # предельное ускорение: выше — речь звучит как скороговорка
+MAX_SPEED_UP_RATIO = 1.2   # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
-TAIL_TOLERANCE = 0.45      # допустимый хвост за окном, чтобы не рубить слова
+TAIL_TOLERANCE = 0.25      # допустимый хвост за окном, чтобы не рубить слова
+ONSET_OFFSET = 0.2         # задержка старта: Whisper помечает начало речи раньше губ
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -912,7 +913,8 @@ def normalize_and_fit(
     window = max(max_seconds, 0.3)
     # Небольшой хвост за окном допустим: на слух это не перебивание, зато слова
     # договариваются до конца. Жёстко режем только если вылезает совсем сильно.
-    hard_limit = window + TAIL_TOLERANCE
+    # Окно уже содержит допуск на хвост, поэтому добавляем лишь малый запас.
+    hard_limit = window + 0.1
     ratio = 1.0
     if actual > window:
         ratio = actual / window
@@ -1058,6 +1060,9 @@ def render_timeline(
                 budget = next_start - segment.start - reserve
         else:
             budget = duration - segment.start
+        # Реплика не должна тянуться дольше, чем говорил человек в оригинале:
+        # иначе голос звучит на кадрах молчания, а паузы-жесты пропадают.
+        budget = min(budget, segment.duration + TAIL_TOLERANCE)
         budgets[segment.index] = max(0.6, budget)
 
     males = sum(1 for s in ordered if s.speaker == "male")
@@ -1141,7 +1146,9 @@ def render_timeline(
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-        placement = segment.start
+        # Небольшая задержка: распознавание помечает начало речи раньше, чем
+        # человек реально открывает рот, поэтому дубляж звучал с опережением.
+        placement = segment.start + ONSET_OFFSET
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
