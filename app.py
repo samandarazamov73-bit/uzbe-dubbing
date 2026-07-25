@@ -292,6 +292,34 @@ class GeminiClient:
             if isinstance(item, dict) and item.get("translated_text") and "id" in item:
                 results[int(item["id"])] = item
 
+    def _translate_single(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        """Простой резервный перевод одной реплики обычным текстом (без JSON).
+
+        Нужен, когда строгий формат с лимитом длины ломается на конкретной строке —
+        лучше перевести её проще, чем уронить весь дубляж.
+        """
+        seconds = max(0.4, item["end"] - item["start"])
+        limit = max(12, int(seconds * 14))
+        prompt = (
+            "Переведи эту реплику на естественный разговорный УЗБЕКСКИЙ язык ЛАТИНИЦЕЙ. "
+            f"Уложись примерно в {limit} символов. Верни ТОЛЬКО перевод, без кавычек, "
+            "пояснений и форматирования:\n" + str(item["text"])
+        )
+        try:
+            data = self._post(
+                self.text_model,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generation_config": {"temperature": 0.3},
+                },
+            )
+            text = self._response_text(data).strip().strip('"').strip()
+        except RuntimeError:
+            return None
+        if not text:
+            return None
+        return {"id": item["index"], "translated_text": text, "speaker": "female", "style": ""}
+
     def translate(self, segments: list[dict[str, Any]], scene: str = "") -> list[DubSegment]:
         # Весь скрипт передаётся как контекст в каждый запрос — перевод получается
         # связным и согласованным, а не «вслепую» по кускам.
@@ -325,9 +353,16 @@ class GeminiClient:
             if not still_missing:
                 return
             if len(still_missing) == 1 or depth >= 4:
-                raise RuntimeError(
-                    f"Gemini не перевёл реплику {still_missing[0]['index'] + 1}"
-                )
+                # Последняя попытка: простой перевод построчно.
+                for item in still_missing:
+                    fallback = self._translate_single(item)
+                    if fallback:
+                        results[item["index"]] = fallback
+                    else:
+                        raise RuntimeError(
+                            f"Gemini не перевёл реплику {item['index'] + 1}"
+                        )
+                return
             middle = len(still_missing) // 2
             run(still_missing[:middle], depth + 1)
             run(still_missing[middle:], depth + 1)
