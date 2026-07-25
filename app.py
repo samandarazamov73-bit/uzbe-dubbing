@@ -81,6 +81,7 @@ MAX_PLACEMENT_SHIFT = 1.5  # предел сдвига реплики, чтоб�
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
+MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
 
 VOICES = [
     "Kore", "Zephyr", "Puck", "Charon", "Fenrir", "Leda", "Orus", "Aoede",
@@ -197,8 +198,19 @@ class GeminiClient:
         cleaned = re.sub(r"\s*```$", "", cleaned)
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Gemini вернул некорректный JSON перевода") from exc
+        except json.JSONDecodeError:
+            pass
+
+        # Ответ мог обрезаться на середине (лимит вывода). Спасаем целые объекты.
+        salvaged: list[Any] = []
+        for match in re.finditer(r"\{[^{}]*\}", cleaned):
+            try:
+                salvaged.append(json.loads(match.group(0)))
+            except json.JSONDecodeError:
+                continue
+        if salvaged:
+            return salvaged
+        raise RuntimeError("Gemini вернул некорректный JSON перевода")
 
     def analyze_scene(self, segments: list[dict[str, Any]]) -> str:
         """Просит Gemini понять сцену целиком: место, отношения, характеры, настроение.
@@ -266,6 +278,7 @@ class GeminiClient:
                 "generation_config": {
                     "temperature": 0.6,
                     "response_mime_type": "application/json",
+                    "max_output_tokens": 8192,
                 },
             },
         )
@@ -291,14 +304,34 @@ class GeminiClient:
                 for item in segments
             ],
             ensure_ascii=False,
-        )
+        )[:MAX_CONTEXT_CHARS]
 
         results: dict[int, dict[str, Any]] = {}
-        step = 40
+
+        def run(batch: list[dict[str, Any]], depth: int = 0) -> None:
+            """Переводит партию; при сбое или пропусках делит её на половины."""
+            missing = [item for item in batch if item["index"] not in results]
+            if not missing:
+                return
+            try:
+                self._translate_batch(context_lines, scene, missing, results)
+            except RuntimeError:
+                if len(missing) == 1 or depth >= 4:
+                    raise
+            still_missing = [item for item in missing if item["index"] not in results]
+            if not still_missing:
+                return
+            if len(still_missing) == 1 or depth >= 4:
+                raise RuntimeError(
+                    f"Gemini не перевёл реплику {still_missing[0]['index'] + 1}"
+                )
+            middle = len(still_missing) // 2
+            run(still_missing[:middle], depth + 1)
+            run(still_missing[middle:], depth + 1)
+
+        step = 20
         for offset in range(0, len(segments), step):
-            self._translate_batch(
-                context_lines, scene, segments[offset : offset + step], results
-            )
+            run(segments[offset : offset + step])
 
         translated: list[DubSegment] = []
         for item in segments:
