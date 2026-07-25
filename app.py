@@ -72,12 +72,8 @@ MAX_VIDEO_MINUTES = int(os.getenv("MAX_VIDEO_MINUTES", "20"))
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_HOURS", "24")) * 3600
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "4")))
-MAX_SPEED_UP_RATIO = 1.12  # предельное ускорение: выше — речь звучит как скороговорка
+MAX_SPEED_UP_RATIO = 1.25  # предельное ускорение: выше — речь звучит как скороговорка
 MIN_SLOWDOWN_RATIO = 0.9   # предельное замедление (растяжение под окно оригинала)
-OVERFLOW_TOLERANCE = 0.35  # насколько реплика может выйти за окно без ускорения
-SPEAKER_CHANGE_GAP = 0.18  # пауза перед ответом другого человека
-SAME_SPEAKER_GAP = 0.06    # пауза между фразами одного человека
-MAX_PLACEMENT_SHIFT = 1.5  # предел сдвига реплики, чтобы дубляж не уполз от видео
 SOURCE_OVERLAP_EPS = 0.08  # с какого наложения в оригинале считаем это перебиванием
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
@@ -888,28 +884,29 @@ def normalize_and_fit(
 ) -> None:
     """Подгоняет длину реплики: target — окно оригинала, max — предел до следующей."""
     actual = media_duration(source)
-    # ВАЖНО: реплику НИКОГДА не обрезаем — ни одно слово не должно потеряться.
-    # Ускоряем только если она сильно вылезает за окно, и очень умеренно, иначе
-    # речь звучит как скороговорка. Небольшое наложение допустимо.
+    # Реплика стоит на своём времени, поэтому должна уложиться в своё окно
+    # (до начала следующей). Сначала пробуем уложиться ускорением — умеренным,
+    # чтобы не было скороговорки. Обрезаем только в крайнем случае.
+    limit = max(max_seconds, 0.3)
     ratio = 1.0
-    if actual > max_seconds + OVERFLOW_TOLERANCE:
-        ratio = actual / max(max_seconds + OVERFLOW_TOLERANCE, 0.25)
+    if actual > limit:
+        ratio = actual / limit
     elif actual < target_seconds * 0.92:
         ratio = actual / max(target_seconds, 0.25)
     ratio = min(max(ratio, MIN_SLOWDOWN_RATIO), MAX_SPEED_UP_RATIO)
     # Пользовательская скорость: <1 — медленнее, >1 — быстрее.
-    ratio = min(max(ratio * speech_speed, 0.7), 1.3)
+    ratio = min(max(ratio * speech_speed, 0.7), 1.35)
 
     chain: list[str] = []
     if abs(ratio - 1.0) > 0.02:
         chain.append(atempo_filter(ratio))
-    # Микрофейды убирают щелчки; выход считаем от фактической длины, не режем.
-    final_length = actual / ratio if ratio > 0 else actual
+    final_length = min(actual / ratio, limit)
     chain.append("afade=t=in:st=0:d=0.015")
-    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.04):.3f}:d=0.04")
+    chain.append(f"afade=t=out:st={max(0.0, final_length - 0.05):.3f}:d=0.05")
     run_command(
         [
             "ffmpeg", "-y", "-i", str(source), "-af", ",".join(chain),
+            "-t", f"{limit:.3f}",
             "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output),
         ],
         timeout=180,
@@ -1020,14 +1017,17 @@ def render_timeline(
     for position, segment in enumerate(ordered):
         if position + 1 < len(ordered):
             next_start = ordered[position + 1].start
-            gap = max(0.0, next_start - segment.end)
-            reserve = min(0.12, gap * 0.35)  # не съедаем всю паузу перед ответом
-            budget = next_start - segment.start - reserve
+            if next_start < segment.end - SOURCE_OVERLAP_EPS:
+                # В оригинале этого человека перебивают — сохраняем его окно,
+                # наложение получится ровно такое же, как в видео.
+                budget = segment.duration
+            else:
+                gap = max(0.0, next_start - segment.end)
+                reserve = min(0.12, gap * 0.35)  # оставляем паузу перед ответом
+                budget = next_start - segment.start - reserve
         else:
             budget = duration - segment.start
-        # Короткой реплике даём минимум ~1 c: небольшое наложение на следующую
-        # фразу естественно для диалога и лучше, чем обрезанное слово.
-        budgets[segment.index] = max(1.0, budget)
+        budgets[segment.index] = max(0.6, budget)
 
     males = sum(1 for s in ordered if s.speaker == "male")
     print(
@@ -1102,31 +1102,15 @@ def render_timeline(
 
     # Раскладка без наложений: реплика никогда не начинается, пока звучит
     # предыдущая. Иначе мужской голос «перебивает» женский, говоря одновременно.
-    previous_end = 0.0
-    previous_speaker = ""
-    previous_source_end: float | None = None
+    # Каждая реплика ставится РОВНО в своё время из видео — никаких сдвигов.
+    # Поэтому дубляж не уползает, а перебивания совпадают с оригиналом сами собой.
     for segment in ordered:
         if segment.index not in generated:
             continue
         fitted, spoken_text, voice = generated[segment.index]
         clip = normalize_clip_level(read_mono_pcm(fitted))
         clip_seconds = len(clip) / sample_rate
-
-        # Наложение повторяет оригинал: если в видео человека перебивают, оставляем
-        # перебивание; если нет — дубляж тоже не должен звучать одновременно.
-        interrupts_in_source = (
-            previous_source_end is not None
-            and segment.start < previous_source_end - SOURCE_OVERLAP_EPS
-        )
-        gap = SPEAKER_CHANGE_GAP if segment.speaker != previous_speaker else SAME_SPEAKER_GAP
         placement = segment.start
-        if not interrupts_in_source and placement < previous_end + gap:
-            # Сдвигаем позже, но не бесконечно — иначе дубляж уползёт от видео.
-            placement = min(previous_end + gap, segment.start + MAX_PLACEMENT_SHIFT)
-        previous_end = max(previous_end, placement + clip_seconds)
-        previous_speaker = segment.speaker
-        previous_source_end = segment.end
-
         start_sample = max(0, int(placement * sample_rate))
         available = min(len(clip), len(timeline) - start_sample)
         for index in range(available):
