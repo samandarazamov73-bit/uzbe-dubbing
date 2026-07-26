@@ -1299,7 +1299,12 @@ def speaker_voice_stats(audio: Path, diarization: Diarization) -> dict[str, Voic
             end = min(len(samples), int(turn.end * rate))
             if end - start < rate // 4:
                 continue
-            values = _segment_pitch_values(samples[start:end], rate, limit=80)
+            # limit — предел кадров НА ЭТОТ turn, не на говорящего целиком: с
+            # шагом 10мс limit=80 обрезал бы даже длинный turn до 0.8с
+            # надёжного сигнала. Масштабируем по реальной длительности turn'а
+            # (с запасом x2 на кадры, не прошедшие порог корреляции).
+            turn_limit = max(80, min(400, int(turn.duration / hop_seconds) * 2))
+            values = _segment_pitch_values(samples[start:end], rate, limit=turn_limit)
             seconds = len(values) * hop_seconds
             if seconds <= 0:
                 continue
