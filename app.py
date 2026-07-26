@@ -112,6 +112,7 @@ MAX_SPEED_UP_RATIO = 1.15   # рабочий предел ускорения (в
 MIN_SLOWDOWN_RATIO = 0.92   # рабочий предел замедления
 EMERGENCY_SPEED_UP = 1.25   # аварийный режим: только для коротких реплик (<2.5 с)
 REGENERATE_OVERFLOW = 1.15  # перегенерируем реплику, если вылезла больше чем на 15%
+MIN_CONDENSE_BUDGET = 1.6   # короче этого — не режем смысл, а просто ускоряем темп
 LOOP_DURATION_FACTOR = 1.8  # длиннее прогноза в 1.8 раза — TTS «зациклился», переозвучиваем
 TTS_PASSES = 3              # столько заходов на реплику: тишина в дубляже недопустима
 TAIL_KEEP_SECONDS = 2.0     # хвост за пределами видео: слово должно договориться
@@ -576,6 +577,12 @@ class GeminiClient:
         overflowing: list[DubSegment] = []
         for unit in units:
             voice = voice_map.get(unit.speaker, voice_map["female"])
+            # Очень короткие окна (реакции "Нет", "Кто...") прогноз almost всегда
+            # считает "переполненными" из-за фиксированной задержки в модели
+            # длительности (PRIOR_COEFFS[0]=0.12с + запас calibrate). Резать смысл
+            # ради полсекунды нельзя — такие реплики отдаём на темп/паузы ниже.
+            if unit.speech_budget < MIN_CONDENSE_BUDGET:
+                continue
             if predict_unit_duration(unit, voice, safe=True) > (
                 unit.speech_budget * REGENERATE_OVERFLOW
             ):
@@ -638,6 +645,13 @@ class GeminiClient:
                     continue
                 current = predict_unit_duration(unit, voice, safe=True)
                 improved = predict_speech_duration(candidate, voice, safe=True)
+                target = syllable_budget(unit.speech_budget, voice)
+                candidate_syllables = uzbek_features(candidate)["syllables"]
+                # Модель иногда режет не до бюджета, а "с запасом" — теряя смысл
+                # там, где хватило бы лёгкой правки. Не принимаем то, что сильно
+                # короче цели: лучше чуть ускорить темп, чем выкинуть половину фразы.
+                if candidate_syllables < max(2, int(target * 0.6)):
+                    continue
                 if improved < current:
                     unit.translated_text = candidate
                     for chunk, text in zip(
