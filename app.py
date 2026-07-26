@@ -2229,6 +2229,46 @@ def _overlap_regions(raw: list[tuple[float, float, str]]) -> list[tuple[float, f
     return merged
 
 
+def _patch_torchaudio_audiometadata_compat() -> None:
+    """Совместимость pyannote.audio 3.x со свежим torchaudio (>=2.9).
+
+    torchaudio.AudioMetaData был deprecated в 2.8 и удалён в 2.9+, а
+    pyannote.audio 3.4.0 всё ещё импортирует его напрямую из torchaudio ->
+    "module 'torchaudio' has no attribute 'AudioMetaData'". Возвращаем
+    отсутствующий класс на место лёгкой заглушкой перед импортом pyannote,
+    не понижая версию torchaudio/torch (это потянуло бы конфликт версий).
+    """
+    try:
+        import torchaudio  # type: ignore[import-not-found]
+    except Exception:
+        return
+    if hasattr(torchaudio, "AudioMetaData"):
+        return
+    try:
+        from dataclasses import dataclass as _dataclass
+
+        @_dataclass
+        class AudioMetaData:  # noqa: N801 - имя обязано совпадать со старым API
+            sample_rate: int
+            num_frames: int
+            num_channels: int
+            bits_per_sample: int = 0
+            encoding: str = ""
+
+        torchaudio.AudioMetaData = AudioMetaData
+        print("[dubbing] добавлена заглушка torchaudio.AudioMetaData для pyannote", flush=True)
+    except Exception:
+        pass
+
+    # torchaudio 2.9+ вместе с AudioMetaData убрал и list_audio_backends —
+    # pyannote/зависимости иногда опрашивают список бэкендов при старте.
+    if not hasattr(torchaudio, "list_audio_backends"):
+        try:
+            torchaudio.list_audio_backends = lambda: ["soundfile"]
+        except Exception:
+            pass
+
+
 def pyannote_diarization(audio: Path) -> Diarization | None:
     """Диаризация pyannote по всему файлу — рекомендуемый путь.
 
@@ -2240,6 +2280,7 @@ def pyannote_diarization(audio: Path) -> Diarization | None:
     backend = os.getenv("DIARIZATION_BACKEND", "auto").strip().lower()
     if backend not in {"auto", "pyannote"}:
         return None
+    _patch_torchaudio_audiometadata_compat()
     try:
         from pyannote.audio import Pipeline  # type: ignore[import-not-found]
     except Exception as exc:

@@ -11,6 +11,15 @@
 # условий модели на huggingface.co.
 
 torch>=2.2,<3
+# Начиная с torchaudio 2.9 убрали torchaudio.AudioMetaData/list_audio_backends
+# (deprecated в 2.8, удалены в 2.9 — переход torchaudio на TorchCodec), а
+# pyannote.audio 3.x на них опирается -> "module 'torchaudio' has no
+# attribute 'AudioMetaData'". НЕ понижаем версию здесь: у torchaudio жёсткая
+# ABI-привязка к конкретной версии torch, и старая версия может не найти
+# совместимую сборку под новый torch (риск ABI-краша хуже самой ошибки).
+# Вместо этого app.py содержит runtime-заглушку
+# (_patch_torchaudio_audiometadata_compat), которая восстанавливает
+# отсутствующие атрибуты перед импортом pyannote.audio.
 torchaudio>=2.2,<3
 # БЕЗ жёсткого ==1.0.0: та версия тянет av==11.0.0 (2023 год) — под свежий
 # FFmpeg (8.x из Homebrew) для неё нет готовой сборки, pip собирает av из
