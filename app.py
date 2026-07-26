@@ -3450,6 +3450,24 @@ def auto_dubbing_pipeline(
             pitch_audio = source_audio
         stats = speaker_voice_stats(pitch_audio, diarization)
         registers = voice_registers(diarization, stats)
+        # Диагностика: stats[label].voiced — это материал ПОСЛЕ строгого фильтра
+        # эталонных участков (>=2.5с, наложение <=10%), а не всё время говорящего.
+        # Печатаем общее время отдельно, чтобы отличить «pyannote дал мало» от
+        # «фильтр эталонов отсеял почти всё» — это разные проблемы и разный фикс.
+        total_by_speaker: dict[str, float] = {}
+        turns_by_speaker: dict[str, int] = {}
+        for turn in diarization.turns:
+            total_by_speaker[turn.speaker] = total_by_speaker.get(turn.speaker, 0.0) + turn.duration
+            turns_by_speaker[turn.speaker] = turns_by_speaker.get(turn.speaker, 0) + 1
+        print(
+            "[dubbing] всего речи на говорящего (до фильтра эталонов): "
+            + ", ".join(
+                f"{label}={total_by_speaker.get(label, 0.0):.1f}с "
+                f"({turns_by_speaker.get(label, 0)} turn'ов)"
+                for label in diarization.speakers
+            ),
+            flush=True,
+        )
         character_voices = assign_character_voices(
             diarization, stats, registers, voice_map, load_voice_fingerprints()
         )
