@@ -2229,6 +2229,39 @@ def _overlap_regions(raw: list[tuple[float, float, str]]) -> list[tuple[float, f
     return merged
 
 
+def _patch_huggingface_hub_use_auth_token_compat() -> None:
+    """Совместимость pyannote.audio 3.x со свежим huggingface_hub (>=1.0).
+
+    huggingface_hub v1.0 убрал параметр use_auth_token у hf_hub_download и
+    родственных функций (заменён на token). pyannote.audio 3.4.0 передаёт
+    use_auth_token напрямую в Pipeline.from_pretrained и дальше во внутренние
+    вызовы hf_hub_download -> "unexpected keyword argument 'use_auth_token'".
+    Оборачиваем сами функции huggingface_hub, а не правим сторонний код
+    pyannote — так работает независимо от того, где внутри pyannote всплывёт
+    этот параметр.
+    """
+    try:
+        import huggingface_hub  # type: ignore[import-not-found]
+    except Exception:
+        return
+    for name in ("hf_hub_download", "snapshot_download"):
+        original = getattr(huggingface_hub, name, None)
+        if original is None or getattr(original, "_use_auth_token_patched", False):
+            continue
+
+        def make_wrapper(func):
+            def wrapper(*args, **kwargs):
+                if "use_auth_token" in kwargs:
+                    kwargs["token"] = kwargs.pop("use_auth_token")
+                return func(*args, **kwargs)
+
+            wrapper._use_auth_token_patched = True
+            return wrapper
+
+        setattr(huggingface_hub, name, make_wrapper(original))
+    print("[dubbing] добавлена заглушка use_auth_token->token для huggingface_hub", flush=True)
+
+
 def _patch_torchaudio_audiometadata_compat() -> None:
     """Совместимость pyannote.audio 3.x со свежим torchaudio (>=2.9).
 
@@ -2281,6 +2314,7 @@ def pyannote_diarization(audio: Path) -> Diarization | None:
     if backend not in {"auto", "pyannote"}:
         return None
     _patch_torchaudio_audiometadata_compat()
+    _patch_huggingface_hub_use_auth_token_compat()
     try:
         from pyannote.audio import Pipeline  # type: ignore[import-not-found]
     except Exception as exc:
@@ -2306,7 +2340,12 @@ def pyannote_diarization(audio: Path) -> Diarization | None:
         if maximum.isdigit():
             options["max_speakers"] = int(maximum)
     try:
-        pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
+        # Разные версии pyannote.audio ожидают либо token=, либо use_auth_token=
+        # в своей публичной сигнатуре — пробуем оба, чтобы не зависеть от версии.
+        try:
+            pipeline = Pipeline.from_pretrained(model, token=token)
+        except TypeError:
+            pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
         if pipeline is None:
             raise RuntimeError("pyannote не отдал pipeline (нужен доступ к модели и HF_TOKEN)")
         annotation = pipeline(str(audio), **options)
