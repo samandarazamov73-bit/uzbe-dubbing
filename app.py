@@ -1272,16 +1272,29 @@ def speaker_voice_stats(audio: Path, diarization: Diarization) -> dict[str, Voic
 
     stats: dict[str, VoiceStats] = {}
     hop_seconds = 0.01
+    # Цель по озвученному материалу — до порога уверенного решения о поле.
+    # Раньше был жёсткий выбор "или все turn'ы, прошедшие строгий фильтр
+    # (>=2.5с, наложение <=10%), или запасной список" — если хотя бы ОДИН
+    # turn проходил фильтр, все остальные (даже с реальной речью) полностью
+    # отбрасывались. Именно так голос со 12с/5 turn'ами реальной речи давал на
+    # выходе только 0.3с материала: один "чистый" turn попадался почти без
+    # voiced-контента, а остальные 4 turn'а с речью в замер вообще не входили.
+    target_voiced = GENDER_CONFIDENT_VOICED * 1.5
     for label, turns in anchors.items():
-        clean = [
-            turn
-            for turn in turns
-            if turn.duration >= ANCHOR_MIN_SECONDS and turn.overlap <= ANCHOR_MAX_OVERLAP
-        ]
-        chosen = clean or sorted(turns, key=lambda item: item.duration, reverse=True)[:6]
+        # Сначала «чистые» длинные turn'ы, затем остальные — по убыванию
+        # длительности. Набираем материал, пока не хватит, а не всё-или-ничего.
+        ordered = sorted(
+            turns,
+            key=lambda item: (
+                not (item.duration >= ANCHOR_MIN_SECONDS and item.overlap <= ANCHOR_MAX_OVERLAP),
+                -item.duration,
+            ),
+        )
         per_turn: list[tuple[float, float]] = []
         voiced = 0.0
-        for turn in sorted(chosen, key=lambda item: item.duration, reverse=True)[:10]:
+        for turn in ordered[:20]:  # предохранитель от лишней работы на длинных видео
+            if voiced >= target_voiced:
+                break
             start = max(0, int(turn.start * rate))
             end = min(len(samples), int(turn.end * rate))
             if end - start < rate // 4:
