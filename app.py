@@ -2302,6 +2302,40 @@ def _patch_torchaudio_audiometadata_compat() -> None:
             pass
 
 
+def _extract_pyannote_tracks(result: Any) -> list[tuple[float, float, str]]:
+    """Достаёт (start, end, speaker_label) из результата pyannote-пайплайна.
+
+    pyannote.audio 3.x возвращал pyannote.core.Annotation (метод
+    .itertracks(yield_label=True)). pyannote.audio 4.x оборачивает результат в
+    новый класс DiarizeOutput с несколькими режимами (обычный/exclusive) —
+    сам Annotation лежит внутри одного из его атрибутов. Перебираем известные
+    варианты по порядку; если ни один не подошёл, печатаем структуру объекта,
+    чтобы это можно было точно диагностировать без гадания.
+    """
+    annotation = result
+    if not hasattr(annotation, "itertracks"):
+        for attr in (
+            "speaker_diarization",
+            "exclusive_speaker_diarization",
+            "annotation",
+            "diarization",
+        ):
+            candidate = getattr(result, attr, None)
+            if candidate is not None and hasattr(candidate, "itertracks"):
+                annotation = candidate
+                break
+    if not hasattr(annotation, "itertracks"):
+        available = [name for name in dir(result) if not name.startswith("_")]
+        raise RuntimeError(
+            f"неизвестный формат результата pyannote (тип {type(result).__name__}, "
+            f"атрибуты: {available})"
+        )
+    return [
+        (float(segment.start), float(segment.end), str(label))
+        for segment, _, label in annotation.itertracks(yield_label=True)
+    ]
+
+
 def pyannote_diarization(audio: Path) -> Diarization | None:
     """Диаризация pyannote по всему файлу — рекомендуемый путь.
 
@@ -2348,11 +2382,8 @@ def pyannote_diarization(audio: Path) -> Diarization | None:
             pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
         if pipeline is None:
             raise RuntimeError("pyannote не отдал pipeline (нужен доступ к модели и HF_TOKEN)")
-        annotation = pipeline(str(audio), **options)
-        raw = [
-            (float(segment.start), float(segment.end), str(label))
-            for segment, _, label in annotation.itertracks(yield_label=True)
-        ]
+        result = pipeline(str(audio), **options)
+        raw = _extract_pyannote_tracks(result)
     except Exception as exc:
         print(f"[dubbing] pyannote не сработал ({exc}) — диаризация через Gemini", flush=True)
         return None
