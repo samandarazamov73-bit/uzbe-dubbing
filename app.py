@@ -127,7 +127,13 @@ SPEAKER_GAP_HARD = 0.08    # абсолютный минимум, ниже — �
 SAME_SPEAKER_GAP = 0.03    # зазор между своими же дыхательными группами
 MAX_SHIFT_ONSCREEN = 0.15  # реплику «в кадре» дальше не двигаем (губы)
 MAX_SHIFT_OFFSCREEN = 0.40 # закадровую/реакцию можно сдвинуть сильнее
-OVERLAP_DUCK = 0.35        # приглушение перебиваемого при неизбежном нахлёсте (~ -9 дБ)
+# Приглушение перебиваемого при неизбежном нахлёсте двух РЕЧЕВЫХ сигналов.
+# -9 дБ (0.35) было мало: два голоса в одной полосе частот маскируют друг
+# друга слабо (в отличие от музыки под речь), слушатель продолжал разбирать
+# оба и слышал наложение как кашу. В озвучке/broadcast фоновый диалог обычно
+# уводят на -15...-20 дБ. Это же значение держит и арифметику клиппинга —
+# см. PEAK_CEILING ниже: peak*(1+OVERLAP_DUCK) должно быть <= 32767.
+OVERLAP_DUCK = 0.15        # ~ -16.5 дБ
 MAX_STYLE_LEN = 400
 MAX_SCENE_LEN = 1200
 MAX_CONTEXT_CHARS = 12000  # ограничение контекста, чтобы ответ не обрывался
@@ -365,7 +371,13 @@ class GeminiClient:
         prompt = (
             "Ты режиссёр дубляжа и переводчик. Ниже SCENE BRIEF (разбор сцены) и CONTEXT — "
             "весь скрипт по порядку. Переведи ТОЛЬКО реплики из TARGET, играя сцену.\n"
-            "Для каждой целевой реплики верни поля:\n"
+            "ПОРЯДОК РАБОТЫ ДЛЯ КАЖДОЙ РЕПЛИКИ СТРОГО ТАКОЙ: сначала переведи её ТОЧНО и "
+            "ПОЛНОСТЬЮ (поле translated_text), не думая о длине вообще — смысл важнее. Только "
+            "ПОСЛЕ ЭТОГО, уже имея готовый точный перевод перед собой, сжимай именно ЕГО (не "
+            "переводи заново!) в short_variant и части. Если сжатие вступает в противоречие с "
+            "точностью смысла — сохраняй смысл, а не длину; short_variant может быть чуть "
+            "длиннее целевого, но не искажать сказанное.\n"
+            "Поля на каждую целевую реплику:\n"
             "1) translated_text — ТОЧНЫЙ и ЖИВОЙ разговорный перевод на УЗБЕКСКИЙ ЛАТИНИЦЕЙ.\n"
             "   ГЛАВНОЕ — ТОЧНОСТЬ СМЫСЛА: переведи именно то, что человек сказал. Ничего не "
             "выдумывай, не добавляй и не выбрасывай смысловые части, сохраняй имена, числа, "
@@ -376,19 +388,21 @@ class GeminiClient:
             "укладывается в окно оригинала, max_syllables — предел. Стремись к "
             "target_syllables и не превышай max_syllables: считай слоги по гласным "
             "(a, e, i, o, u, oʻ), учитывай, что цифры произносятся словами, а узбекские "
-            "окончания добавляют слоги. Короче — лучше, чем длиннее.\n"
-            "2) short_variant — тот же смысл, но на 20-30% КОРОЧЕ по слогам (убери вводные "
-            "слова, повторы и местоимения). Он пойдёт в дело, если основной вариант не влезет "
-            "в тайминг. Смысл, имена и числа обязаны сохраниться.\n"
-            "3) parts — ТОЛЬКО если у реплики в TARGET есть массив source_parts: верни ровно "
-            "столько же узбекских частей, в том же порядке и с тем же распределением смысла. "
-            "Части разделены реальными паузами актёра, их длительность сохраняется.\n"
+            "окончания добавляют слоги. Короче — лучше, чем длиннее, НО НЕ ЗА СЧЁТ СМЫСЛА.\n"
+            "2) short_variant — СЖАТИЕ ТОЛЬКО ЧТО НАПИСАННОГО translated_text (не новый "
+            "перевод с нуля), на 20-30% короче по слогам: убери вводные слова, повторы и "
+            "местоимения. Он пойдёт в дело, если основной вариант не влезет в тайминг. Смысл, "
+            "имена и числа обязаны сохраниться.\n"
+            "3) parts — ТОЛЬКО если у реплики в TARGET есть массив source_parts: раздели "
+            "translated_text на ровно столько же узбекских частей, в том же порядке и с тем же "
+            "распределением смысла (не переводи части отдельно от целого). Части разделены "
+            "реальными паузами актёра, их длительность сохраняется.\n"
             "4) style — ПОДРОБНАЯ актёрская ремарка на английском (одно живое предложение): "
             "эмоция, подтекст, энергия, темп, отношение персонажа и, если уместно, невербалика "
             '(короткий смешок, вздох, придыхание, заминка). Например: "flustered and defensive, '
             'a nervous little laugh, speaks fast and a bit high". Разным персонажам — заметно '
             "разные ремарки.\n"
-            "Верни только JSON-массив "
+            "Верни только JSON-массив, translated_text у каждого объекта ПЕРВЫМ полем: "
             '[{"id":0,"translated_text":"...","short_variant":"...","parts":["..."],'
             '"style":"..."}] строго для id из TARGET.\n\n'
             + scene_block
@@ -402,7 +416,10 @@ class GeminiClient:
             {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generation_config": {
-                    "temperature": 0.6,
+                    # Точность смысла важнее разнообразия формулировок — ниже,
+                    # чем раньше (было 0.6), чтобы соблюдение слогового бюджета
+                    # не конкурировало за "внимание" модели с точностью перевода.
+                    "temperature": 0.3,
                     "response_mime_type": "application/json",
                     "max_output_tokens": 8192,
                 },
@@ -2850,9 +2867,66 @@ def read_mono_pcm(path: Path) -> array:
     return samples
 
 
+SOFT_LIMIT_KNEE = 0.90     # доля от 32767, откуда начинается мягкое сжатие пика
+
+
+def soft_limit_to_int16(float_samples: array) -> array:
+    """Float32-таймлайн -> int16 с мягким лимитером вместо жёсткого клампа.
+
+    Раньше каждый сэмпл кламповался в [-32768, 32767] сразу при сложении —
+    редкие пересечения двух клипов на пике превышали потолок и хард-клипились
+    точечно (слышно как треск на стыках, а не общий хрип). Теперь сложение
+    идёт в float без промежуточного клипинга, а сюда попадает уже готовая
+    сумма: значения ниже колена (90% от 32767) проходят как есть, выше —
+    сжимаются мягкой кривой (tanh), а не обрубаются.
+    """
+    knee = 32767.0 * SOFT_LIMIT_KNEE
+    ceiling = 32767.0
+    span = max(1.0, ceiling - knee)
+    result = array("h", bytes(2 * len(float_samples)))
+    for index, value in enumerate(float_samples):
+        magnitude = abs(value)
+        if magnitude <= knee:
+            limited = value
+        else:
+            over = magnitude - knee
+            # tanh сжимает превышение так, чтобы асимптота не превышала ceiling.
+            compressed = knee + span * math.tanh(over / span)
+            limited = compressed if value >= 0 else -compressed
+        result[index] = max(-32768, min(32767, int(round(limited))))
+    return result
+
+
+def diagnose_timeline_clipping(
+    float_samples: array, sample_rate: int, threshold: float = 32767.0
+) -> list[tuple[float, float]]:
+    """Находит места, где сумма сэмплов до лимитера превышала потолок int16.
+
+    Диагностика по совету из внешнего разбора: печатаем не «что-то не так», а
+    точный список таймкодов и пиковых значений — это те самые точки, где без
+    мягкого лимитера был бы точечный треск на стыках реплик.
+    """
+    events: list[tuple[float, float]] = []
+    last_reported = -1.0
+    for index, value in enumerate(float_samples):
+        magnitude = abs(value)
+        if magnitude > threshold:
+            moment = index / sample_rate
+            if moment - last_reported >= 0.05:  # не дублировать одно и то же превышение
+                events.append((moment, magnitude))
+                last_reported = moment
+    return events
+
+
 TARGET_CLIP_RMS = 3600.0  # целевая громкость каждой реплики (из 32767)
 MAX_CLIP_GAIN = 3.5       # выше — звук перегружается и хрипит
-PEAK_CEILING = 29000.0    # запас до предела, чтобы не было клиппинга
+# Раньше 29000: при двух клипах на пике одновременно (наложение, приглушённый
+# клип на OVERLAP_DUCK) сумма 29000 + 29000*0.35 = 39150 > 32767 — гарантированный
+# хард-клиппинг именно в точках пересечения (точечный треск на отдельных
+# репликах, а не искажение всего клипа). Инвариант, который должен держаться:
+#   PEAK_CEILING * (1 + OVERLAP_DUCK) <= 32767
+# 27000 * 1.15 = 31050 — укладывается с запасом ~5%.
+PEAK_CEILING = 27000.0
 
 
 def normalize_clip_level(clip: array) -> array:
@@ -3025,7 +3099,11 @@ def render_timeline(
 ) -> Path:
     sample_rate = 24000
     # Запас в конце: реплики больше не обрезаются и могут выходить за окно.
-    timeline = array("h", [0]) * (int(duration * sample_rate) + sample_rate * 12)
+    # Микшируем в float32, а не int16: поэлементный хард-клипинг на каждом
+    # сложении жертвовал точками пересечения клипов (два клипа на пике даже
+    # после дакинга давали сумму > 32767 -> точечный треск на стыках). Клип и
+    # мягкий лимитер применяются один раз, на финальном шаге.
+    timeline = array("f", [0.0]) * (int(duration * sample_rate) + sample_rate * 12)
     segments_dir = work_dir / "segments"
     segments_dir.mkdir(exist_ok=True)
     transcript: list[dict[str, Any]] = []
@@ -3210,10 +3288,11 @@ def render_timeline(
             sample_position = start_sample + index
             existing = timeline[sample_position]
             # Неизбежное наложение: приглушаем того, кого перебивают, а не рубим.
+            # Складываем в float — без промежуточного клампа; финальный лимитер
+            # применяется один раз при записи в WAV.
             if existing and clip[index]:
-                existing = int(existing * OVERLAP_DUCK)
-            mixed = existing + clip[index]
-            timeline[sample_position] = max(-32768, min(32767, mixed))
+                existing *= OVERLAP_DUCK
+            timeline[sample_position] = existing + clip[index]
         if placement.ducked:
             ducked_count += 1
         if chunk.ratio > MAX_SPEED_UP_RATIO + 0.01:
@@ -3269,7 +3348,18 @@ def render_timeline(
     # Последняя реплика не обрезается по концу видео: слово должно договориться.
     # Раньше фраза на 44-й секунде 45-секундного ролика рубилась на полуслове.
     keep_seconds = min(duration + TAIL_KEEP_SECONDS, max(duration, previous_end + 0.2))
-    final_samples = timeline[: int(keep_seconds * sample_rate)]
+    float_samples = timeline[: int(keep_seconds * sample_rate)]
+    clip_events = diagnose_timeline_clipping(float_samples, sample_rate)
+    if clip_events:
+        preview = "; ".join(
+            f"{start:.2f}s ({peak:.0f}/32767)" for start, peak in clip_events[:8]
+        )
+        print(
+            f"[dubbing] ВНИМАНИЕ: пересведение превышало 32767 в {len(clip_events)} "
+            f"местах (мягкий лимитер сгладил): {preview}",
+            flush=True,
+        )
+    final_samples = soft_limit_to_int16(float_samples)
     if sys.byteorder != "little":
         final_samples.byteswap()
     with wave.open(str(output), "wb") as wav:
