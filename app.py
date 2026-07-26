@@ -2242,9 +2242,12 @@ def pyannote_diarization(audio: Path) -> Diarization | None:
         return None
     try:
         from pyannote.audio import Pipeline  # type: ignore[import-not-found]
-    except Exception:
-        if backend == "pyannote":
-            print("[dubbing] pyannote.audio не установлен — диаризация через Gemini", flush=True)
+    except Exception as exc:
+        # ВАЖНО: печатаем причину всегда, а не только при backend="pyannote".
+        # Раньше при DIARIZATION_BACKEND=auto (по умолчанию) любая ошибка
+        # импорта — не только "не установлен", но и реальный сбой версий —
+        # проглатывалась без единого сообщения в лог.
+        print(f"[dubbing] pyannote.audio не импортировался ({exc}) — диаризация через Gemini", flush=True)
         return None
 
     model = os.getenv("PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1")
